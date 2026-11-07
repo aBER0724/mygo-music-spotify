@@ -1,0 +1,63 @@
+{
+  "id": "spotify",
+  "name": "Spotify",
+  "version": "0.4.2",
+  "minAppVersion": "0.1.22",
+  "main": "src/index.js",
+  "playback": "remote",
+  "permissions": {
+    "network": [
+      "accounts.spotify.com",
+      "api.spotify.com",
+      "lrclib.net",
+      "music.163.com"
+    ],
+    "process": [
+      "soloist/soloist",
+      "soloist/soloist.exe",
+      "curl",
+      "tar"
+    ]
+  },
+  "settings": [
+    {
+      "key": "clientId",
+      "label": "Client ID",
+      "help": "Create an app in the Spotify Developer Dashboard with the Web API, add http://127.0.0.1:43821/callback as its redirect URI, then paste its Client ID here.",
+      "link": "https://developer.spotify.com/dashboard"
+    },
+    {
+      "key": "soloistKey",
+      "label": "Soloist API key",
+      "help": "Optional. Lets the plugin play on this computer through Spotify Soloist, Spotify's own player, without the Spotify app open. Generate the key with your Premium account in Spotify for Developers. Then pair it once: after saving the key, open the Spotify app on your phone or this computer, on the same network, and choose \"MyGo Music on Mac\" (\"MyGo Music on Windows\" on Windows) in its list of devices.",
+      "link": "https://developer.spotify.com/documentation/soloist/tutorials/getting-started"
+    }
+  ],
+  "navigation": [
+    {
+      "builtin": "home"
+    },
+    {
+      "title": "Top tracks",
+      "page": "top",
+      "icon": "chart"
+    },
+    {
+      "title": "Recently played",
+      "page": "recent",
+      "icon": "calendar"
+    },
+    {
+      "title": "Liked Songs",
+      "builtin": "liked"
+    },
+    {
+      "title": "Albums",
+      "builtin": "savedAlbums"
+    },
+    {
+      "title": "Podcasts",
+      "builtin": "shows"
+    }
+  ]
+}

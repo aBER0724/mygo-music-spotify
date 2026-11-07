@@ -1,0 +1,24 @@
+{
+  "name": "mygo-music-spotify",
+  "version": "0.4.2",
+  "private": true,
+  "type": "module",
+  "description": "Spotify for MyGo Music: catalog, library and playback through Spotify Connect.",
+  "license": "AGPL-3.0-only",
+  "author": "starriv",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/starriv/mygo-music-spotify.git"
+  },
+  "homepage": "https://github.com/starriv/mygo-music-spotify#readme",
+  "bugs": "https://github.com/starriv/mygo-music-spotify/issues",
+  "engines": {
+    "node": ">=22.2"
+  },
+  "scripts": {
+    "check": "node --check src/index.js && node --check scripts/verify.mjs && node --check scripts/pack.mjs",
+    "test": "node --test --test-timeout=30000 \"test/*.test.mjs\"",
+    "verify": "npm run check && node scripts/verify.mjs && npm test",
+    "pack": "npm run verify && node scripts/pack.mjs"
+  }
+}
