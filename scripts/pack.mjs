@@ -2,12 +2,16 @@
 // tests, no session data, no downloaded Soloist). No dependencies: a ZIP
 // is written here with Node's zlib. Entries carry a fixed time, so the same
 // sources always make the same bytes.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { crc32, deflateRawSync } from "node:zlib";
 
 const root = new URL("../", import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL("plugin.json", root), "utf8"));
-const files = ["plugin.json", manifest.main, "locales/zh-CN.json", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"];
+const locales = readdirSync(new URL("locales/", root))
+  .filter((name) => name.endsWith(".json"))
+  .sort()
+  .map((name) => `locales/${name}`);
+const files = ["plugin.json", manifest.main, ...locales, "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "soloist/README.txt"];
 
 const DOS_TIME = 0; // 00:00:00
 const DOS_DATE = ((2026 - 1980) << 9) | (1 << 5) | 1; // 2026-01-01

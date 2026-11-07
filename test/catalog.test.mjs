@@ -113,3 +113,104 @@ test("a short rate limit is waited out once", async () => {
   await plugin.liked({ offset: 0 });
   assert.equal(calls, 2);
 });
+
+test("home asks only for the first playlists it shows", async () => {
+  const pages = [];
+  const { plugin } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    if (call.url.pathname === "/v1/me/playlists") {
+      pages.push(Number(call.url.searchParams.get("offset") || 0));
+      return json({
+        items: Array.from({ length: 50 }, (_, i) => ({ id: `p${i}`, name: `P${i}`, owner: { id: "listener" }, items: { total: 0 } })),
+        next: "https://api.spotify.com/v1/me/playlists?offset=50",
+      });
+    }
+    return json({ items: [], next: null });
+  }, { saved: signedIn() });
+  await plugin.home();
+  assert.deepEqual(pages, [0]);
+});
+
+test("a 404 from Spotify is unavailable, with words the listener can act on", async () => {
+  const { plugin } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    if (call.url.pathname === "/v1/me/library/contains") return json([false]);
+    return json({ error: { status: 404, message: "non existing id" } }, 404);
+  }, { saved: signedIn() });
+  await assert.rejects(plugin.album({ id: "gone" }), { code: "unavailable", message: /can't find this/ });
+  await assert.rejects(plugin.artist({ id: "gone" }), { code: "unavailable" });
+});
+
+test("an image without a width isn't chosen by width", async () => {
+  const album = (images) => ({
+    id: "al", name: "A", images,
+    artists: [], release_date: "", tracks: { items: [track("a")], next: null },
+  });
+  let images = [{ url: "https://i.scdn.co/1000", width: 1000 }, { url: "https://i.scdn.co/no-width" }];
+  const { plugin } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    if (call.url.pathname === "/v1/me/library/contains") return json([false]);
+    return json(album(images));
+  }, { saved: signedIn() });
+  assert.equal((await plugin.album({ id: "al" })).album.imageUrl, "https://i.scdn.co/1000");
+  images = [{ url: "https://i.scdn.co/only" }];
+  assert.equal((await plugin.album({ id: "al" })).album.imageUrl, "https://i.scdn.co/only");
+});
+
+test("descriptions are decoded once, and a plain one keeps its angle brackets", async () => {
+  const { plugin } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    if (call.url.pathname === "/v1/shows/s1") {
+      return json({ id: "s1", name: "Show", description: "plain <b> text", html_description: "<p>A &#38;lt; B</p>", total_episodes: 1 });
+    }
+    if (call.url.pathname === "/v1/shows/s1/episodes") {
+      return json({ items: [{ id: "e1", name: "Ep", description: "episode <i> plain", duration_ms: 1 }], next: null });
+    }
+    return json([false]);
+  }, { saved: signedIn() });
+  const page = await plugin.show({ id: "s1" });
+  // "&#38;lt;" is the text "&lt;", not a second entity to turn into "<".
+  assert.equal(page.show.description, "A &lt; B");
+  assert.equal(page.episodes[0].description, "episode <i> plain");
+});
+
+test("a search keeps its place across a plugin restart, without keeping the query", async () => {
+  const store = new Map();
+  const offsets = [];
+  const handler = (call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    if (call.url.pathname !== "/v1/search") throw new Error(`unexpected ${call.url.pathname}`);
+    const offset = Number(call.url.searchParams.get("offset"));
+    offsets.push(offset);
+    const items = Array.from({ length: 10 }, (_, i) => (i % 3 === 0 ? null : {
+      id: `p${offset + i}`, name: `List ${offset + i}`, owner: { id: "someone" }, items: { total: 4 },
+    }));
+    return json({ playlists: { items, next: offset < 20 ? "https://api.spotify.com/v1/search?offset=x" : null } });
+  };
+  let ctx = await setup(handler, { saved: signedIn(), store });
+  const first = await ctx.plugin.search({ query: "mix", kind: "playlists", offset: 0 });
+  assert.equal(first.playlists.length, 6);
+  // A restarted plugin has its own module state, but the host's storage stays.
+  ctx = await setup(handler, { saved: signedIn(), store });
+  const second = await ctx.plugin.search({ query: "mix", kind: "playlists", offset: 6 });
+  assert.deepEqual(offsets, [0, 10]);
+  assert.equal(second.playlists[0].id, "p11");
+  // The listener's query itself isn't kept in the plugin's storage.
+  assert.ok(!JSON.stringify(store.get("searchCursors")).includes("mix"));
+});
+
+test("a search still answers when it can't save its place", async () => {
+  const { plugin } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    if (call.url.pathname !== "/v1/search") throw new Error(`unexpected ${call.url.pathname}`);
+    return json({ tracks: { items: [track("a")], next: null } });
+  }, { saved: signedIn() });
+  const set = globalThis.host.storage.set;
+  globalThis.host.storage.set = () => { throw new Error("disk full"); };
+  try {
+    const page = await plugin.search({ query: "x", kind: "tracks", offset: 0 });
+    assert.deepEqual(page.tracks.map((t) => t.id), ["a"]);
+  } finally {
+    globalThis.host.storage.set = set;
+  }
+});

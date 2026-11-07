@@ -1,7 +1,7 @@
 {
-  "id": "spotify",
+  "id": "spotify-connect",
   "name": "Spotify",
-  "version": "0.4.2",
+  "version": "1.0.0",
   "minAppVersion": "0.1.22",
   "main": "src/index.js",
   "playback": "remote",

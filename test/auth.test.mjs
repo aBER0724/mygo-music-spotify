@@ -139,3 +139,55 @@ test("signing in again while the browser sign-in waits reuses it, not the busy p
   answer({ code: "c", state: new URL(opened[0]).searchParams.get("state") });
   assert.deepEqual(await first, await second);
 });
+
+test("signing in doesn't need TextEncoder", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "TextEncoder");
+  Object.defineProperty(globalThis, "TextEncoder", { value: undefined, configurable: true });
+  try {
+    let authorize;
+    const { plugin } = await setup((call) => {
+      if (call.url.pathname === "/api/token") {
+        const form = new URLSearchParams(call.body);
+        const challenge = createHash("sha256").update(form.get("code_verifier")).digest("base64url");
+        assert.equal(challenge, authorize.get("code_challenge"));
+        return json({ access_token: "a", refresh_token: "r", expires_in: 3600 });
+      }
+      return json(me);
+    }, {
+      redirect: async (_options, opened) => {
+        await Promise.resolve();
+        authorize = new URL(opened[0]).searchParams;
+        return { code: "c", state: authorize.get("state") };
+      },
+    });
+    assert.deepEqual(await plugin.signIn(), { id: "listener", name: "Listener", imageUrl: "", page: "me" });
+  } finally {
+    Object.defineProperty(globalThis, "TextEncoder", descriptor);
+  }
+});
+
+test("signing in works without Web Crypto, as MyGo Music's runtime has none", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  Object.defineProperty(globalThis, "crypto", { value: undefined, configurable: true });
+  try {
+    let authorize;
+    const { plugin } = await setup((call) => {
+      if (call.url.pathname === "/api/token") {
+        const form = new URLSearchParams(call.body);
+        const challenge = createHash("sha256").update(form.get("code_verifier")).digest("base64url");
+        assert.equal(challenge, authorize.get("code_challenge"));
+        return json({ access_token: "a", refresh_token: "r", expires_in: 3600 });
+      }
+      return json(me);
+    }, {
+      redirect: async (_options, opened) => {
+        await Promise.resolve();
+        authorize = new URL(opened[0]).searchParams;
+        return { code: "c", state: authorize.get("state") };
+      },
+    });
+    assert.deepEqual(await plugin.signIn(), { id: "listener", name: "Listener", imageUrl: "", page: "me" });
+  } finally {
+    Object.defineProperty(globalThis, "crypto", descriptor);
+  }
+});

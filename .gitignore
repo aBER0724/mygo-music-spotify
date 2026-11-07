@@ -1,7 +1,9 @@
 /dist/
 /node_modules/
-# Downloaded at run time when the plugin is run from this folder.
-/soloist/
+# Downloaded at run time when the plugin is run from this folder; the folder
+# ships with a note so that it exists to unpack Soloist into.
+/soloist/*
+!/soloist/README.txt
 # MyGo Music keeps these beside a plugin run in place.
 /storage.json
 /settings.json

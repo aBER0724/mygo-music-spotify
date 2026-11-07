@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  json, empty, signedIn, setup, track, me, playing, fakeSoloist, fastPolling,
+  CLIENT, json, empty, signedIn, setup, track, me, playing, fakeSoloist, fastPolling,
 } from "./helpers.mjs";
 
 test("remote play sends a window of the queue from the chosen song", async () => {
@@ -179,4 +179,17 @@ test("a remembered device that's gone is forgotten", async (t) => {
   await plugin.remotePlay({ ids: ["a"], start: 0, position: 0 });
   assert.deepEqual(plays, ["old", "mac"]);
   assert.equal(storage.get("device"), undefined);
+});
+
+test("player commands with nothing playing say to open Spotify", async () => {
+  const notFound = () => json({ error: { status: 404, message: "Player command failed: No active device found", reason: "NO_ACTIVE_DEVICE" } }, 404);
+  const { plugin } = await setup(notFound, { saved: signedIn(), settings: { clientId: CLIENT } });
+  for (const call of [
+    () => plugin.remotePause(),
+    () => plugin.remoteResume(),
+    () => plugin.remoteSeek({ position: 1000 }),
+    () => plugin.remoteVolume({ percent: 50 }),
+  ]) {
+    await assert.rejects(call(), { code: "unavailable", message: /Open Spotify/ });
+  }
 });

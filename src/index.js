@@ -35,6 +35,9 @@ const EDIT_BATCH = 100; // playlist edits take at most 100 items
 const QUEUE_WINDOW = 50;
 const REQUEST_TIMEOUT = 15000;
 const REFRESH_MARGIN = 60000;
+// The shortest a request within a play's deadline may be given: enough to
+// answer, and to say why it didn't before the app gives the command up.
+const MIN_REQUEST = 1000;
 
 // The host loads a module while holding its storage lock: read storage inside
 // an exported action, never while the module initializes.
@@ -42,7 +45,7 @@ let session; // undefined until read; null when signed out
 let epoch = 0;
 let refreshing = null;
 let me = null;
-const searchCursors = new Map();
+let searchCursors; // undefined until read: shown counts to Spotify's offsets
 
 const t = (text) => host.t(text);
 
@@ -85,7 +88,8 @@ function clearSession() {
   session = null;
   refreshing = null;
   me = null;
-  searchCursors.clear();
+  pendingSignIn = null;
+  forgetSearchCursors();
   stopLocal();
   host.storage.remove("session");
 }
@@ -161,23 +165,63 @@ function base64url(bytes) {
   return out;
 }
 
+// utf8Bytes is the UTF-8 of text, for hashing: moejs needn't have TextEncoder.
+function utf8Bytes(text) {
+  const out = [];
+  for (const character of String(text)) {
+    const code = character.codePointAt(0);
+    if (code < 0x80) out.push(code);
+    else if (code < 0x800) out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    else if (code < 0x10000) out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    else out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+  }
+  return Uint8Array.from(out);
+}
+
+// randomBytes answers bytes no one else can guess. MyGo Music's runtime has
+// no Web Crypto (0.1.22), so when getRandomValues is missing, mix what the
+// runtime does have: time, the runtime's own randomness, and platform. The
+// verifier only has to stay unguessable for the minutes a sign-in takes.
+function randomBytes(length) {
+  const values = new Uint8Array(length);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(values);
+    return values;
+  }
+  let seed = `${Date.now()}|${globalThis.performance?.now?.() ?? ""}|${host.platform}|${host.arch}`;
+  for (let i = 0; i < 16; i++) seed += `|${Math.random()}`;
+  let state = sha256(utf8Bytes(seed));
+  for (let offset = 0; offset < values.length; offset += 32) {
+    const input = new Uint8Array(34);
+    input.set(state);
+    input[32] = offset & 0xff;
+    input[33] = (offset >> 8) & 0xff;
+    state = sha256(input);
+    values.set(state.subarray(0, Math.min(32, values.length - offset)), offset);
+  }
+  return values;
+}
+
 function randomString(length) {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-  const values = new Uint8Array(length);
-  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(values);
-  else for (let i = 0; i < length; i++) values[i] = Math.floor(Math.random() * 256);
-  return Array.from(values, (v) => chars[v % chars.length]).join("");
+  return Array.from(randomBytes(length), (v) => chars[v % chars.length]).join("");
 }
 
 function codeChallenge(verifier) {
-  return base64url(sha256(new TextEncoder().encode(verifier)));
+  return base64url(sha256(utf8Bytes(verifier)));
 }
 
 // --- Requests -----------------------------------------------------------
 
-async function timedFetch(url, init) {
+// timeoutFor answers how long a request may take: its usual limit, or less,
+// as a play that must answer before the app gives it up has left.
+const timeoutFor = (deadline) => (Number.isFinite(deadline)
+  ? Math.max(MIN_REQUEST, Math.min(REQUEST_TIMEOUT, deadline - Date.now()))
+  : REQUEST_TIMEOUT);
+
+async function timedFetch(url, init, deadline) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+  const timer = setTimeout(() => controller.abort(), timeoutFor(deadline));
   try {
     return await fetch(url, { ...init, signal: controller.signal, redirect: "error" });
   } catch {
@@ -258,6 +302,8 @@ function apiError(status, body) {
     error = fail("setup", t("This Spotify account isn't allowed to use your app. Add it under User Management in the Spotify Developer Dashboard."));
   } else if (status === 429) {
     error = fail("", t("Spotify is limiting requests. Wait a moment and try again."));
+  } else if (status === 404) {
+    error = fail("unavailable", t("Spotify can't find this. It may have been removed."));
   } else if (status >= 500) {
     error = fail("", `${t("Spotify is having trouble. Try again shortly.")} (HTTP ${status})`);
   } else {
@@ -270,7 +316,7 @@ function apiError(status, body) {
 
 // api calls the Web API as the signed-in listener. path is relative to /v1,
 // or a `next` link Spotify gave.
-async function api(method, path, { query, body, attempt = 0 } = {}) {
+async function api(method, path, { query, body, attempt = 0, deadline } = {}) {
   const active = requireSession();
   const generation = epoch;
   let url = path.startsWith("https://") ? path : API + path;
@@ -291,14 +337,14 @@ async function api(method, path, { query, body, attempt = 0 } = {}) {
     headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(body);
   }
-  const response = await timedFetch(url, init);
+  const response = await timedFetch(url, init, deadline);
   if (generation !== epoch) throw changed();
   const data = await readJSON(response);
   if (response.ok) return data;
   if (response.status === 401 && attempt === 0) {
     // The token can be revoked before it expires: refresh once.
     active.expiresAt = 0;
-    return api(method, path, { query, body, attempt: 1 });
+    return api(method, path, { query, body, attempt: 1, deadline });
   }
   if (response.status === 401) {
     if (session === active) clearSession();
@@ -308,14 +354,14 @@ async function api(method, path, { query, body, attempt = 0 } = {}) {
   if (method === "GET" && [502, 503, 504].includes(response.status) && attempt === 0) {
     await sleep(1000);
     if (generation !== epoch) throw changed();
-    return api(method, path, { query, body, attempt: 1 });
+    return api(method, path, { query, body, attempt: 1, deadline });
   }
   if (response.status === 429 && attempt === 0) {
     const wait = Number(response.headers.get("retry-after"));
     if (Number.isFinite(wait) && wait >= 0 && wait <= 5) {
       await sleep(Math.max(wait, 1) * 1000);
       if (generation !== epoch) throw changed();
-      return api(method, path, { query, body, attempt: 1 });
+      return api(method, path, { query, body, attempt: 1, deadline });
     }
   }
   throw apiError(response.status, data);
@@ -358,9 +404,13 @@ function offsetOf(value) {
 // Now Playing about 600 pixels: take the widest up to 800.
 function image(images) {
   if (!Array.isArray(images)) return "";
-  const usable = images.filter((item) => item?.url).sort((a, b) => (b.width || 0) - (a.width || 0));
-  const pick = usable.find((item) => (item.width || 0) <= 800) || usable[usable.length - 1];
-  return pick?.url || "";
+  const usable = images
+    .filter((item) => item?.url && Number.isFinite(item.width))
+    .sort((a, b) => b.width - a.width);
+  // An image without a width can't be sized; only fall back to one if none has.
+  if (!usable.length) return images.find((item) => item?.url)?.url || "";
+  const pick = usable.find((item) => item.width <= 800) || usable[usable.length - 1];
+  return pick.url;
 }
 
 // A character reference, or itself when it names no character.
@@ -368,14 +418,23 @@ function codePoint(code, text) {
   return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : text;
 }
 
+const ENTITIES = { quot: "\"", apos: "'", lt: "<", gt: ">", nbsp: " ", amp: "&" };
+
 function plainText(html) {
+  // One pass, so "&#38;lt;" decodes to "&lt;" and not to "<".
   return String(html || "")
     .replace(/<[^>]*>/g, "")
-    .replace(/&#x([0-9a-f]{1,6});/gi, (text, hex) => codePoint(parseInt(hex, 16), text))
-    .replace(/&#(\d{1,7});/g, (text, dec) => codePoint(Number(dec), text))
-    .replace(/&quot;/g, "\"").replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+    .replace(/&#x([0-9a-f]{1,6});|&#(\d{1,7});|&(quot|apos|lt|gt|nbsp|amp);/gi, (text, hex, dec, name) => {
+      if (hex) return codePoint(parseInt(hex, 16), text);
+      if (dec) return codePoint(Number(dec), text);
+      return ENTITIES[name.toLowerCase()] ?? text;
+    })
     .trim();
+}
+
+// plainOrHtml is for a description Spotify sends both as text and as HTML.
+function plainOrHtml(text, html) {
+  return html ? plainText(html) : String(text || "").trim();
 }
 
 function toArtist(artist = {}) {
@@ -402,7 +461,7 @@ function toEpisode(episode, show = episode.show) {
     artists: show?.name ? [{ id: "", name: show.name }] : [],
     album: { id: "", name: show?.name || "", imageUrl: image(episode.images) || image(show?.images) },
     duration: episode.duration_ms || 0,
-    description: plainText(episode.description || episode.html_description),
+    description: plainOrHtml(episode.description, episode.html_description),
     published: episode.release_date || "",
     url: episode.external_urls?.spotify || `https://open.spotify.com/episode/${episode.id}`,
     unavailable: episode.is_playable === false,
@@ -444,7 +503,7 @@ function toPlaylist(playlist, profile) {
 function toShow(show) {
   return {
     id: show.id, name: show.name || "", imageUrl: image(show.images),
-    description: plainText(show.description || show.html_description),
+    description: plainOrHtml(show.description, show.html_description),
     episodeCount: show.total_episodes || 0,
   };
 }
@@ -589,8 +648,9 @@ async function completeSignIn(id, url, verifier, state) {
     host.signInPrompt({ text: t("Signed in") });
     return result;
   } catch (error) {
-    // A Development Mode app refuses accounts not on its user list.
-    if (session === pending) clearSession();
+    // A Development Mode app refuses accounts not on its user list. A passing
+    // failure of the profile read doesn't make the sign-in worth discarding.
+    if (session === pending && (error.code === "setup" || error.code === "signIn")) clearSession();
     throw error;
   }
 }
@@ -600,6 +660,8 @@ export function signOut() {
   // The listener can remove the app's access at spotify.com/account/apps.
   clearSession();
   forgetLocal();
+  // A built-in player chosen for this account isn't chosen for the next one.
+  host.storage.remove("device");
 }
 
 export function setSetting({ key, value }) {
@@ -607,7 +669,9 @@ export function setSetting({ key, value }) {
     // Start Soloist with the new key right away, in the background, so it can
     // be paired from a Spotify app now, before the first play asks for it.
     stopLocal();
-    if (String(value || "").trim() && clientId() && currentSession()) startLocal().catch(() => {});
+    const next = String(value || "").trim();
+    if (next && clientId() && currentSession()) startLocal().catch(() => {});
+    if (!next && host.storage.get("device") === LOCAL) host.storage.remove("device");
   }
   if (key === "clientId") {
     clearSession();
@@ -656,7 +720,7 @@ const emptyOr = (result, empty) => (result.error ? `${t("Couldn't load this.")} 
 export async function home() {
   requireSession();
   const [recentResult, tracksResult, artistsResult, listsResult] = await settled([
-    recentTracks(), topTracks("short_term", 20), topArtists("medium_term", 20), playlists(),
+    recentTracks(), topTracks("short_term", 20), topArtists("medium_term", 20), playlists(20),
   ]);
   return {
     title: "Spotify",
@@ -717,14 +781,61 @@ export async function recent() {
 
 // The app asks for the next page at the number of results it already shows.
 // Spotify can answer null for an item it no longer has, so remember where in
-// Spotify's own results each shown count ends.
+// Spotify can answer null for an item it no longer has, so the app's count of
+// results shown isn't Spotify's offset. Each page's mapping is kept in the
+// plugin's storage too, so a restarted plugin still asks for the right page.
+const SEARCH_CURSORS = "searchCursors";
+const SEARCH_CURSOR_KEYS = 20; // queries remembered
+const SEARCH_CURSOR_OFFSETS = 400; // pages remembered for one
+
+function searchCursorState() {
+  if (searchCursors) return searchCursors;
+  let saved;
+  try { saved = host.storage.get(SEARCH_CURSORS); } catch { saved = null; }
+  searchCursors = new Map();
+  if (saved && typeof saved === "object") {
+    for (const [key, pairs] of Object.entries(saved)) {
+      if (!Array.isArray(pairs)) continue;
+      const cursor = new Map();
+      for (const pair of pairs) {
+        if (Array.isArray(pair) && pair.length === 2
+          && Number.isSafeInteger(pair[0]) && Number.isSafeInteger(pair[1])) {
+          cursor.set(pair[0], pair[1]);
+        }
+      }
+      if (cursor.size) searchCursors.set(key, cursor);
+    }
+  }
+  return searchCursors;
+}
+
+function persistSearchCursors() {
+  const saved = {};
+  for (const [key, cursor] of searchCursors || new Map()) {
+    saved[key] = [...cursor.entries()].slice(-SEARCH_CURSOR_OFFSETS);
+  }
+  // Keeping the place is a convenience: a search still answers without it.
+  try { host.storage.set(SEARCH_CURSORS, saved); } catch {}
+}
+
+function forgetSearchCursors() {
+  searchCursors = undefined;
+  try { host.storage.remove(SEARCH_CURSORS); } catch {}
+}
+
+// searchKey keeps the listener's query out of the plugin's storage.
+function searchKey(kind, text) {
+  return base64url(sha256(utf8Bytes(`${kind}\n${text}`)));
+}
+
 function searchCursor(key, offset) {
-  let cursor = searchCursors.get(key);
+  const all = searchCursorState();
+  let cursor = all.get(key);
   if (!cursor || offset === 0) {
     cursor = new Map([[0, 0]]);
-    searchCursors.delete(key);
-    searchCursors.set(key, cursor);
-    while (searchCursors.size > 20) searchCursors.delete(searchCursors.keys().next().value);
+    all.delete(key);
+    all.set(key, cursor);
+    while (all.size > SEARCH_CURSOR_KEYS) all.delete(all.keys().next().value);
   }
   return cursor;
 }
@@ -740,7 +851,7 @@ export async function search({ query, kind = "tracks", offset = 0 }) {
   if (!text) return { [kind]: [], more: false };
   requireSession();
   offset = offsetOf(offset);
-  const cursor = searchCursor(`${kind}\n${text}`, offset);
+  const cursor = searchCursor(searchKey(kind, text), offset);
   const raw = cursor.get(offset) ?? offset;
   const data = await api("GET", "/search", { query: { q: text, type: type[0], limit: SEARCH_LIMIT, offset: raw } });
   const page = data?.[kind] || {};
@@ -748,14 +859,15 @@ export async function search({ query, kind = "tracks", offset = 0 }) {
   const map = type[1] || (await profile().then((profileResult) => (item) => toPlaylist(item, profileResult)));
   const results = items.filter(Boolean).map(map);
   cursor.set(offset + results.length, raw + items.length);
+  persistSearchCursors();
   return { [kind]: results, more: !!page.next && items.length > 0 };
 }
 
 // --- Library ------------------------------------------------------------
 
-export async function playlists() {
+export async function playlists(max = 2000) {
   const profileResult = await profile();
-  const { items } = await collect("/me/playlists", { limit: PAGE }, 2000);
+  const { items } = await collect("/me/playlists", { limit: PAGE }, max);
   return items.filter(Boolean).map((item) => toPlaylist(item, profileResult));
 }
 
@@ -821,7 +933,11 @@ function editableURIs(trackIds) {
 
 export async function addToPlaylist({ id, trackIds }) {
   id = idOf(id);
-  const uris = editableURIs(trackIds).filter((uri) => !uri.startsWith("spotify:local:"));
+  const uris = editableURIs(trackIds);
+  // Local files can be taken out of a playlist by URI, but not added or moved.
+  if (uris.some((uri) => uri.startsWith("spotify:local:"))) {
+    throw fail("unsupported", t("Spotify can't add local files to a playlist through the Web API."));
+  }
   for (const batch of chunks(uris, EDIT_BATCH)) {
     await api("POST", `/playlists/${id}/items`, { body: { uris: batch } });
   }
@@ -1070,8 +1186,8 @@ function usableDevices(list) {
   return (list || []).filter((device) => device?.id && !device.is_restricted);
 }
 
-async function listDevices() {
-  return usableDevices((await api("GET", "/me/player/devices"))?.devices);
+async function listDevices(deadline) {
+  return usableDevices((await api("GET", "/me/player/devices", { deadline }))?.devices);
 }
 
 const deviceQuery = (device) => (device ? { device_id: device } : undefined);
@@ -1083,6 +1199,10 @@ const deviceQuery = (device) => (device ? { device_id: device } : undefined);
 // Spotify as one more device. Spotify doesn't allow passing its binary on, so
 // the plugin downloads it from Spotify the first time, into soloist/ in the
 // plugin's folder, and again when the build expires after 90 days.
+//
+// The archive it downloads is kept in the plugin's data folder, which an
+// update of the plugin doesn't replace: the update installs Soloist from
+// there, rather than downloading it again.
 //
 // Soloist needs the listener's own API key, from Spotify for Developers, and
 // signs in through Spotify Connect: the first time, the listener picks it once
@@ -1100,6 +1220,16 @@ const SOLOIST_ARCHIVES = {
   "linux-arm64": "soloist_release_arm64.tar.gz",
 };
 const SOLOIST_EXPIRED = 10; // its exit code once the build is too old
+// Spotify lets a build work for 90 days after its build date. Treat one a day
+// short of that as stale, rather than start a play on it.
+const SOLOIST_BUILD_MAX_AGE = 89 * 24 * 60 * 60 * 1000;
+// Where the downloaded archive waits, in the plugin's data folder. An update
+// replaces the plugin's folder, not that: Soloist is installed from the
+// archive there again, rather than downloaded again.
+const SOLOIST_STAGE = "soloist-download";
+// A download that just failed is asked for again at once, as the app moves on
+// to the next song: let a moment pass before asking Spotify again.
+const SOLOIST_RETRY_AFTER = 15000;
 // How long a command waits for the built-in player before saying what it's
 // waiting for: the app gives a command 30 seconds, and the rest of a play
 // may have taken some already.
@@ -1110,6 +1240,7 @@ const LOCAL_POLL_EVERY = 1500;
 const LOCAL_GIVE_UP = 10 * 60 * 1000;
 let local = null; // { process, ready, exited, code, name, stage, lines, key, deviceId }
 let downloading = null;
+let downloadFailure = null; // why the last download failed, until it's asked for again
 
 function localName() {
   return host.platform === "windows" ? "MyGo Music on Windows" : host.platform === "darwin" ? "MyGo Music on Mac" : "MyGo Music";
@@ -1119,8 +1250,22 @@ function soloistKey() {
   return String(host.setting("soloistKey") || "").trim();
 }
 
+function soloistArchive() {
+  return SOLOIST_ARCHIVES[`${host.platform}-${host.arch}`];
+}
+
+// soloistOffered says whether the built-in player could run here at all: with
+// the listener's key, on a computer Spotify makes Soloist for.
+function soloistOffered() {
+  return !!soloistKey() && !!soloistArchive();
+}
+
 function soloistBinary() {
   return `soloist/soloist${host.platform === "windows" ? ".exe" : ""}`;
+}
+
+function stagedSoloist(archive) {
+  return `${host.dataDir}/${SOLOIST_STAGE}/${archive}`;
 }
 
 function stopLocal() {
@@ -1134,7 +1279,10 @@ function stopLocal() {
 // Forget Soloist's session, for another account to pair it.
 function forgetLocal() {
   stopLocal();
-  try { host.removeDataDir("soloist"); } catch {}
+  // The pairing, and the audio it cached: another account pairs it anew.
+  for (const name of ["soloist", "soloist-cache"]) {
+    try { host.removeDataDir(name); } catch {}
+  }
 }
 
 function spawnProgram(command, args) {
@@ -1145,6 +1293,10 @@ function spawnProgram(command, args) {
     if (/allowed/i.test(message)) {
       throw fail("setup", t("To play on this computer without the Spotify app, allow this plugin to start programs in its settings."));
     }
+    // The plugin's own manifest doesn't name it: a wrong download won't fix it.
+    if (/process permission|one of the programs/i.test(message)) {
+      throw fail("setup", t("This version of the plugin can't start the programs it needs. Update the plugin, or update MyGo Music."));
+    }
     throw error;
   }
 }
@@ -1153,54 +1305,132 @@ function lastLines(text, count = 1) {
   return String(text || "").split("\n").map((line) => line.trim()).filter(Boolean).slice(-count).join(" ").slice(0, 200);
 }
 
-// run starts a program, reads what it writes, and answers its exit code.
+// run starts a program, reads what it writes, and answers its exit code, and
+// the last of what it wrote.
 async function run(command, args) {
   const program = spawnProgram(command, args);
-  (async () => { try { while ((await program.readLine()) !== null); } catch {} })();
+  const lines = [];
+  try {
+    for (let line; (line = await program.readLine()) !== null;) {
+      if (lines.length < 40) lines.push(line);
+    }
+  } catch {}
   const code = await program.wait();
   let errors = "";
   try { errors = program.errorOutput(); } catch {}
-  return { code, errors };
+  return { code, errors, lines };
 }
 
-// downloadSoloist fetches the current build from Spotify with curl and
-// unpacks it with tar, which macOS and Windows 10 and later come with.
+function unsupportedSoloist() {
+  return fail("unavailable", t("Spotify Soloist isn't made for this computer. Open Spotify on your computer or phone, then play again."));
+}
+
+// checkSoloist runs the binary just installed: is it Soloist, and is its build
+// within the days Spotify lets one work?
+async function checkSoloist() {
+  const version = await run(soloistBinary(), ["--version"]);
+  const text = [...version.lines, ...String(version.errors || "").split("\n")].join("\n");
+  if (version.code === SOLOIST_EXPIRED || /client expired|update to continue using/i.test(text)) {
+    return { ok: false, expired: true };
+  }
+  if (version.code !== 0 || !/\bsoloist\b/i.test(text)) return { ok: false };
+  const build = /\bbuild\s+(\d{9,11})\b/.exec(text);
+  if (build && Date.now() - Number(build[1]) * 1000 > SOLOIST_BUILD_MAX_AGE) {
+    return { ok: false, expired: true };
+  }
+  return { ok: true };
+}
+
+// unpackStagedSoloist installs the archive kept from an earlier download,
+// for a plugin update that took the binary with the old plugin's folder.
+async function unpackStagedSoloist(archive) {
+  try {
+    const unpacked = await run("tar", ["-xf", stagedSoloist(archive), "-C", "soloist"]);
+    if (unpacked.code !== 0) return false;
+    return (await checkSoloist()).ok;
+  } catch {
+    // No tar, or no archive: a download is the way from here.
+    return false;
+  }
+}
+
+// installSoloist puts Soloist in the plugin's folder: from the archive an
+// earlier download kept, or from Spotify.
+async function installSoloist() {
+  if (downloading) {
+    await downloading;
+    return;
+  }
+  const archive = soloistArchive();
+  if (!archive) throw unsupportedSoloist();
+  if (await unpackStagedSoloist(archive)) return;
+  await downloadSoloist();
+}
+
+// downloadSoloist fetches the current build from Spotify with curl, unpacks it
+// with tar, which macOS and Windows 10 and later come with, and checks that
+// what it unpacked runs. The archive stays in the plugin's data folder, for
+// the next plugin update to install from rather than download again.
 function downloadSoloist() {
   if (downloading) return downloading;
-  const archive = SOLOIST_ARCHIVES[`${host.platform}-${host.arch}`];
-  if (!archive) {
-    return Promise.reject(fail("unavailable", t("Spotify Soloist isn't made for this computer. Open Spotify on your computer or phone, then play again.")));
+  const archive = soloistArchive();
+  if (!archive) return Promise.reject(unsupportedSoloist());
+  // The app moves on to the next song when one fails: don't ask Spotify for
+  // the same build over and over.
+  const last = downloadFailure;
+  if (last && last.archive === archive && Date.now() - last.at < SOLOIST_RETRY_AFTER) {
+    return Promise.reject(fail(last.code, last.message));
   }
-  const file = `soloist/${archive}`;
+  const staged = stagedSoloist(archive);
   const job = (async () => {
     try {
-      await fetchAndUnpack(archive, file);
+      const fetched = await run("curl", [
+        "--fail", "--location", "--silent", "--show-error", "--create-dirs",
+        // Spotify's address only, and only over https, also after a redirect.
+        "--proto", "=https", "--proto-redir", "=https",
+        // Retry a passing failure, timeouts included: a download cut short is
+        // fetched again, rather than unpacked broken.
+        "--retry", "3", "--retry-delay", "1", "--retry-max-time", "120", "--retry-all-errors",
+        "--connect-timeout", "20", "--max-time", "300", "--max-filesize", "67108864",
+        "--output", staged, SOLOIST_CDN + archive,
+      ]);
+      if (fetched.code !== 0) {
+        throw fail("unavailable", `${t("Couldn't download Spotify Soloist.")} (${lastLines(fetched.errors) || `curl ${fetched.code}`})`);
+      }
+      const unpacked = await run("tar", ["-xf", staged, "-C", "soloist"]);
+      if (unpacked.code !== 0) {
+        throw fail("unavailable", `${t("Couldn't unpack Spotify Soloist.")} (${lastLines(unpacked.errors) || `tar ${unpacked.code}`})`);
+      }
+      const checked = await checkSoloist();
+      if (!checked.ok) {
+        throw fail("unavailable", checked.expired
+          ? t("Spotify's Soloist build has expired. Try again in a moment.")
+          : t("The downloaded Spotify Soloist can't run. Try again."));
+      }
     } catch (error) {
-      if (error.code) throw error;
-      throw fail("unavailable", `${t("Couldn't download Spotify Soloist.")} (${String(error?.message || "").slice(0, 200)})`);
+      // Nothing half downloaded is left for an install to trust later.
+      try { host.removeDataDir(SOLOIST_STAGE); } catch {}
+      const failure = error.code
+        ? error
+        : fail("unavailable", `${t("Couldn't download Spotify Soloist.")} (${String(error?.message || "").slice(0, 200)})`);
+      downloadFailure = { archive, at: Date.now(), code: failure.code, message: failure.message };
+      throw failure;
     }
   })();
   downloading = job;
   const done = () => { if (downloading === job) downloading = null; };
-  job.then(done, done);
+  job.then(() => { downloadFailure = null; done(); }, done);
   return job;
 }
 
-async function fetchAndUnpack(archive, file) {
-  const fetched = await run("curl", [
-    "--fail", "--location", "--silent", "--show-error", "--create-dirs",
-    "--retry", "2", "--connect-timeout", "20", "--max-time", "300",
-    "--output", file, SOLOIST_CDN + archive,
-  ]);
-  if (fetched.code !== 0) throw fail("unavailable", `${t("Couldn't download Spotify Soloist.")} (${lastLines(fetched.errors) || `curl ${fetched.code}`})`);
-  const unpacked = await run("tar", ["-xf", file, "-C", "soloist"]);
-  if (unpacked.code !== 0) throw fail("unavailable", `${t("Couldn't unpack Spotify Soloist.")} (${lastLines(unpacked.errors) || `tar ${unpacked.code}`})`);
-}
-
-// launch starts Soloist, downloading it first if it isn't here yet.
-async function launch(running, downloaded = false) {
+// launch starts Soloist, installing it first if it isn't here yet.
+async function launch(running, installed = false) {
   running.stage = "starting";
   running.exited = false;
+  // A relaunched Soloist is a new process: what the old one wrote, and the
+  // device ID it had, don't say anything about it.
+  running.lines = [];
+  running.deviceId = "";
   try {
     running.process = spawnProgram(soloistBinary(), [
       "--device-name", running.name, "--api-key", running.key,
@@ -1209,10 +1439,10 @@ async function launch(running, downloaded = false) {
     ]);
   } catch (error) {
     if (error.code) throw error;
-    // Not there yet, or left broken by a download cut short: fetch it once.
-    if (downloaded) throw fail("unavailable", `${t("Spotify Soloist couldn't start.")} (${String(error?.message || "").slice(0, 200)})`);
+    // Not there yet, or left broken by a download cut short: install it once.
+    if (installed) throw fail("unavailable", `${t("Spotify Soloist couldn't start.")} (${String(error?.message || "").slice(0, 200)})`);
     running.stage = "downloading";
-    await downloadSoloist();
+    await installSoloist();
     return launch(running, true);
   }
   const program = running.process;
@@ -1232,12 +1462,44 @@ async function launch(running, downloaded = false) {
   program.wait().then((code) => { running.exited = true; running.code = code; }, () => { running.exited = true; });
 }
 
-// localFailure says why Soloist stopped, from the last of what it wrote.
-function localFailure(running) {
+// localText is what Soloist wrote, without the timestamps it puts before it.
+function localText(running) {
   let errors = "";
   try { errors = running.process.errorOutput(); } catch {}
-  const text = [...running.lines, ...String(errors).split("\n")].map((line) => line.replace(/^\d{4}-\d\d-\d\d [\d:.]+:\s*/, "").trim()).filter(Boolean);
-  const reason = [...text].reverse().find((line) => /error|fail|invalid|denied|key|expired|premium/i.test(line)) || text[text.length - 1] || `exit ${running.code}`;
+  return [...running.lines, ...String(errors).split("\n")]
+    .map((line) => line.replace(/^\d{4}-\d\d-\d\d [\d:.]+:\s*/, "").trim())
+    .filter(Boolean);
+}
+
+// localReason picks why it stopped: the last line that sounds like a reason.
+function localReason(running) {
+  const text = localText(running);
+  return [...text].reverse().find((line) => /error|fail|invalid|denied|key|expired|premium/i.test(line))
+    || text[text.length - 1] || `exit ${running.code}`;
+}
+
+// soloistExpired says whether it stopped because its build is too old: its
+// documented exit code, or what it last said.
+function soloistExpired(running) {
+  return running.code === SOLOIST_EXPIRED || localText(running).some((line) => /client expired|update to continue using/i.test(line));
+}
+
+// soloistLocked says whether another Soloist still holds its data folder.
+function soloistLocked(running) {
+  return localText(running).some((line) => /another (?:session|instance) is running/i.test(line));
+}
+
+// localFailure says why Soloist stopped, in words the listener can act on.
+function localFailure(running) {
+  const reason = localReason(running);
+  // A Soloist left running by MyGo Music that didn't close still holds the
+  // data folder: only the listener can end it.
+  if (/another (?:session|instance) is running/i.test(reason)) {
+    return fail("unavailable", t("Spotify Soloist is still running from an earlier MyGo Music session. Quit MyGo Music and Soloist (Activity Monitor on a Mac, Task Manager on Windows), then play again."));
+  }
+  if (/client expired|update to continue using/i.test(reason)) {
+    return fail("unavailable", t("Spotify's Soloist build has expired. Try again in a moment."));
+  }
   return fail("unavailable", `${t("Spotify Soloist stopped.")} (${reason.slice(0, 200)})`);
 }
 
@@ -1246,15 +1508,30 @@ function localFailure(running) {
 async function follow(running, generation) {
   await launch(running);
   let renewed = false;
-  const deadline = Date.now() + LOCAL_GIVE_UP;
+  let lockRetried = false;
+  // Look often at first, then less: a listener pairing it sees no difference,
+  // and the background wait stops asking Spotify four hundred times.
+  let poll = LOCAL_POLL_EVERY;
+  let deadline = Date.now() + LOCAL_GIVE_UP;
   while (Date.now() < deadline) {
-    await sleep(LOCAL_POLL_EVERY);
+    await sleep(poll);
     if (local !== running || generation !== epoch) throw changed();
     if (running.exited) {
-      if (running.code === SOLOIST_EXPIRED && !renewed) {
+      if (soloistExpired(running) && !renewed) {
         renewed = true;
         running.stage = "downloading";
         await downloadSoloist();
+        await launch(running, true);
+        // The wait for pairing starts over with the new build.
+        deadline = Date.now() + LOCAL_GIVE_UP;
+        poll = LOCAL_POLL_EVERY;
+        continue;
+      }
+      // A Soloist that is still shutting down lets its folder go shortly.
+      if (soloistLocked(running) && !lockRetried) {
+        lockRetried = true;
+        await sleep(LOCAL_POLL_EVERY);
+        if (local !== running || generation !== epoch) throw changed();
         await launch(running, true);
         continue;
       }
@@ -1263,17 +1540,25 @@ async function follow(running, generation) {
     let devices;
     try {
       devices = await listDevices();
+      poll = LOCAL_POLL_EVERY;
     } catch (error) {
-      // A passing network error doesn't end the wait; signing out does.
+      // A passing network error doesn't end the wait; signing out does, and a
+      // rate limit is no reason to keep asking as often.
       if (error.code === "signIn" || error.code === "setup") throw error;
+      poll = Math.min(poll * 2, 30000);
       continue;
     }
-    // Until it has said its ID, nothing counts as it.
-    const device = running.deviceId && devices.find((item) => item.id === running.deviceId);
+    // Its own ID when it has said it, so another computer's Soloist of the
+    // same name on the same account isn't taken for this one; by name only
+    // if it never says the ID.
+    const device = running.deviceId
+      ? devices.find((item) => item.id === running.deviceId)
+      : devices.find((item) => item.name === running.name);
     if (device) {
       running.stage = "ready";
       return device.id;
     }
+    poll = Math.min(poll * 2, 5000);
   }
   throw fail("unavailable", t("Spotify Soloist wasn't paired in time. Play again to try once more."));
 }
@@ -1303,7 +1588,7 @@ async function startLocal(wait = LOCAL_WAIT) {
     // What an earlier version kept for librespot, its built-in player before.
     if (!local) { try { host.removeDataDir("librespot"); } catch {} }
     stopLocal();
-    const running = { process: null, exited: false, name: localName(), stage: "starting", lines: [], key, failed: false };
+    const running = { process: null, exited: false, name: localName(), stage: "starting", lines: [], key, deviceId: "", failed: false };
     local = running;
     running.ready = follow(running, epoch);
     running.ready.catch(() => { running.failed = true; });
@@ -1318,30 +1603,57 @@ async function startLocal(wait = LOCAL_WAIT) {
   }
 }
 
+// waitWithin is how long starting the built-in player may take within the
+// caller's deadline, keeping some of it for the command that follows.
+function waitWithin(deadline) {
+  if (!Number.isFinite(deadline)) return LOCAL_WAIT;
+  return Math.max(0, Math.min(LOCAL_WAIT, deadline - Date.now() - 3000));
+}
+
 // Resolve the stored device: the built-in player starts once it's needed.
-async function preferredDevice() {
+async function preferredDevice(deadline = Infinity) {
   const stored = host.storage.get("device") || undefined;
-  return stored === LOCAL ? startLocal() : stored;
+  if (stored !== LOCAL) return stored;
+  // Its key may have been taken away since: an open Spotify app plays instead.
+  if (!soloistOffered()) {
+    host.storage.remove("device");
+    return undefined;
+  }
+  return startLocal(waitWithin(deadline));
 }
 
 // withDevice runs a player command on the device the listener chose, or the
 // one playing, or any Spotify app that's open, or else the built-in player.
-async function withDevice(command) {
-  const preferred = await preferredDevice();
+async function withDevice(command, deadline = Infinity, restarted = false) {
+  const preferred = await preferredDevice(deadline);
   try {
     return await command(preferred);
   } catch (error) {
     if (error.status !== 404) throw error;
+    // The built-in player's device left Spotify while its process still ran:
+    // start it again, once, so this computer can play again.
+    if (!restarted && host.storage.get("device") === LOCAL && local) {
+      stopLocal();
+      return withDevice(command, deadline, true);
+    }
     // A remembered device that's gone, such as one that was renamed, isn't
     // tried again before every play.
     if (preferred && host.storage.get("device") === preferred) host.storage.remove("device");
   }
-  const devices = await listDevices();
+  const devices = await listDevices(deadline);
   const target = devices.find((device) => device.is_active) || devices.find((device) => device.id === preferred) || devices[0];
   if (!target) {
-    const id = await startLocal();
-    host.storage.set("device", LOCAL);
-    return command(id);
+    const id = await startLocal(waitWithin(deadline));
+    // Only a device that answered is remembered, so a failed play doesn't
+    // leave the built-in player chosen for every later one.
+    try {
+      const answer = await command(id);
+      host.storage.set("device", LOCAL);
+      return answer;
+    } catch (error) {
+      if (error.status === 404) throw fail("unavailable", t("Open Spotify on your computer or phone, then play again."));
+      throw error;
+    }
   }
   try {
     return await command(target.id);
@@ -1372,14 +1684,27 @@ const PLAY_BUDGET = 25000;
 
 // confirmPlaying answers null once Spotify plays, or else the device that
 // didn't start, looking until the deadline at the latest.
-async function confirmPlaying(uris, deadline = Infinity) {
+// device is where the play command went, or "" when Spotify chose. Another
+// device playing something else doesn't count as this one having started:
+// that is how an offline device Spotify kept listed as active stays hidden.
+async function confirmPlaying(uris, deadline = Infinity, device = "") {
   const wanted = new Set(uris.map((uri) => uri.split(":").pop()));
+  const targeted = !!device;
   let last = null;
-  for (let i = 0; i < CONFIRM_TRIES && (i === 0 || Date.now() + CONFIRM_EVERY < deadline); i++) {
+  for (let i = 0; i < CONFIRM_TRIES && Date.now() < deadline; i++) {
+    if (i > 0 && Date.now() + CONFIRM_EVERY > deadline) break;
     await sleep(CONFIRM_EVERY);
-    last = await api("GET", "/me/player", { query: { additional_types: "episode" } });
-    // A relinked track can play under another ID, so playing counts as well.
-    if (last?.item && (last.is_playing || wanted.has(last.item.id))) return null;
+    try {
+      last = await api("GET", "/me/player", { query: { additional_types: "episode" }, deadline });
+    } catch (error) {
+      // A passing error while checking doesn't mean the play failed.
+      if (error.code === "signIn" || error.code === "setup") throw error;
+      continue;
+    }
+    if (!last?.item) continue;
+    // A relinked track can play under another ID, so the device asked counts
+    // as well, as does any device when Spotify chose it.
+    if (wanted.has(last.item.id) || (last.is_playing && (!targeted || last.device?.id === device))) return null;
   }
   return { id: last?.device?.id || "", name: last?.device?.name || "" };
 }
@@ -1403,12 +1728,19 @@ export async function remotePlay({ ids, start = 0, position = 0 }) {
   const tried = new Set();
   const play = (device) => {
     if (device) tried.add(device);
-    return api("PUT", "/me/player/play", { query: deviceQuery(device), body });
+    return api("PUT", "/me/player/play", { query: deviceQuery(device), body, deadline });
   };
-  await withDevice(play);
-  let silent = await confirmPlaying(uris, deadline);
+  await withDevice(play, deadline);
+  // Whatever happened, what follows has to answer before the app gives up, so
+  // its own message reaches the listener rather than a timeout.
+  if (left() <= MIN_REQUEST) throw fail("", t("Spotify took too long to answer. Try again."));
+  let silent = await confirmPlaying(uris, deadline, tried.size ? [...tried].at(-1) : "");
   if (silent) {
-    const devices = await listDevices();
+    if (left() <= MIN_REQUEST) {
+      deviceFailure = { name: silent.name, at: Date.now() };
+      throw deviceDidNotStart(silent.name);
+    }
+    const devices = await listDevices(deadline);
     // Sent without a device, the command went to the one Spotify had active.
     if (!tried.size) for (const device of devices) if (device.is_active) tried.add(device.id);
     if (silent.id) tried.add(silent.id);
@@ -1419,10 +1751,10 @@ export async function remotePlay({ ids, start = 0, position = 0 }) {
     if (silent.name) silentNames.add(silent.name);
     const other = devices.find((device) => !tried.has(device.id) && !silentNames.has(device.name));
     // Too little time left to try another device is the same as none.
-    const id = left() < 4000 ? null : other ? other.id : await startLocal(Math.min(LOCAL_WAIT, left() - 3000));
+    const id = left() < 4000 ? null : other ? other.id : await startLocal(waitWithin(deadline));
     if (id && !tried.has(id)) {
       await play(id);
-      const again = await confirmPlaying(uris, deadline);
+      const again = await confirmPlaying(uris, deadline, id);
       if (!again) host.storage.set("device", other ? other.id : LOCAL);
       silent = again && { ...again, name: again.name || other?.name || localName() };
     }
@@ -1442,16 +1774,36 @@ function ignoreRestriction(error) {
   throw error;
 }
 
+// Spotify answers 404 to a player command with nothing playing anywhere: say
+// what to do about it, rather than pass on the raw status.
+const nothingPlaying = () => fail("unavailable", t("Open Spotify on your computer or phone, then play again."));
+
 export async function remotePause() {
-  await api("PUT", "/me/player/pause").catch(ignoreRestriction);
+  try {
+    await api("PUT", "/me/player/pause");
+  } catch (error) {
+    if (error.status === 404) throw nothingPlaying();
+    ignoreRestriction(error);
+  }
 }
 
 export async function remoteResume() {
-  await withDevice((device) => api("PUT", "/me/player/play", { query: deviceQuery(device) })).catch(ignoreRestriction);
+  const deadline = Date.now() + PLAY_BUDGET;
+  try {
+    await withDevice((device) => api("PUT", "/me/player/play", { query: deviceQuery(device), deadline }), deadline);
+  } catch (error) {
+    if (error.status === 404 || (error.code === "setup" && !soloistKey())) throw nothingPlaying();
+    ignoreRestriction(error);
+  }
 }
 
 export async function remoteSeek({ position }) {
-  await api("PUT", "/me/player/seek", { query: { position_ms: Math.max(0, Math.floor(Number(position) || 0)) } });
+  try {
+    await api("PUT", "/me/player/seek", { query: { position_ms: Math.max(0, Math.floor(Number(position) || 0)) } });
+  } catch (error) {
+    if (error.status === 404) throw nothingPlaying();
+    throw error;
+  }
 }
 
 export async function remoteVolume({ percent }) {
@@ -1459,6 +1811,7 @@ export async function remoteVolume({ percent }) {
   try {
     await api("PUT", "/me/player/volume", { query: { volume_percent: value } });
   } catch (error) {
+    if (error.status === 404) throw nothingPlaying();
     if (error.status === 403 && error.reason !== "PREMIUM_REQUIRED") {
       throw fail("", t("This Spotify device doesn't let others change its volume."));
     }
@@ -1485,9 +1838,10 @@ export async function remoteState() {
 // it isn't running yet.
 export async function remoteDevices() {
   const devices = (await listDevices()).map((device) => ({ id: device.id, name: device.name || "Spotify", active: !!device.is_active }));
-  const offered = soloistKey() && SOLOIST_ARCHIVES[`${host.platform}-${host.arch}`];
-  const running = local?.deviceId && devices.some((device) => device.id === local.deviceId);
-  if (offered && !running) {
+  const running = local?.stage === "ready" && (local.deviceId
+    ? devices.some((device) => device.id === local.deviceId)
+    : devices.some((device) => device.name === localName()));
+  if (soloistOffered() && !running) {
     devices.push({ id: LOCAL, name: t("This computer (Spotify Soloist)"), active: false });
   }
   return devices;
@@ -1496,6 +1850,8 @@ export async function remoteDevices() {
 export async function remoteUse({ deviceId }) {
   const id = String(deviceId || "");
   if (!id) throw fail("", t("Choose a device."));
+  // The device the listener chose replaces one a failed play named.
+  deviceFailure = null;
   const builtIn = id === LOCAL || (local?.stage === "ready" && (await local.ready.catch(() => "")) === id);
   const target = id === LOCAL ? await startLocal() : id;
   await api("PUT", "/me/player", { body: { device_ids: [target] } });

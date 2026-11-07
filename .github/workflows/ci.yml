@@ -3,7 +3,8 @@ name: CI
 # Every push and pull request is verified. A push to main whose plugin.json
 # version has no release yet is released: CI tags the commit v<version> and
 # publishes plugin.zip, which MyGo Music installs from the latest release,
-# with the version's CHANGELOG entry as the notes.
+# with the version's CHANGELOG entry as the notes when it has one, and
+# GitHub's generated notes otherwise.
 
 on:
   push:
@@ -24,6 +25,27 @@ jobs:
           node-version: 22
       - run: npm run verify
       - run: node scripts/pack.mjs
+      - name: Check plugin.zip
+        run: |
+          python3 - <<'PY'
+          import json, os, zipfile
+          with zipfile.ZipFile("dist/plugin.zip") as z:
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit(f"corrupt entry: {bad}")
+              names = set(z.namelist())
+          manifest = json.load(open("plugin.json"))
+          wanted = {"plugin.json", manifest["main"], "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "soloist/README.txt"}
+          wanted |= {f"locales/{name}" for name in os.listdir("locales") if name.endswith(".json")}
+          if not wanted <= names:
+              raise SystemExit(f"missing from plugin.zip: {sorted(wanted - names)}")
+          print(f"plugin.zip ok: {len(names)} entries")
+          PY
+      - name: The same sources make the same plugin.zip
+        run: |
+          sha=$(sha256sum dist/plugin.zip | cut -d' ' -f1)
+          node scripts/pack.mjs >/dev/null
+          test "$sha" = "$(sha256sum dist/plugin.zip | cut -d' ' -f1)"
       - uses: actions/upload-artifact@v7
         with:
           name: plugin
@@ -71,5 +93,8 @@ jobs:
         run: |
           version="${TAG#v}"
           awk -v v="$version" 'index($0, "## [" v "]") == 1 { on = 1; next } /^## \[/ { on = 0 } on' CHANGELOG.md > notes.md
-          test -s notes.md || { echo "CHANGELOG.md has no entry for $version"; exit 1; }
-          gh release create "$TAG" dist/plugin.zip --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
+          if [ -s notes.md ]; then
+            gh release create "$TAG" dist/plugin.zip --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/plugin.zip --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+          fi

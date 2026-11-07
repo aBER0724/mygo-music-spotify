@@ -76,3 +76,11 @@ test("playlist edits use /items, and moves match the app's final index", async (
     ["PUT", "/v1/playlists/pl/items", { range_start: 3, insert_before: 0, range_length: 1 }],
   ]);
 });
+
+test("adding a local file to a playlist says Spotify can't", async () => {
+  const { plugin } = await setup(() => json({}), { saved: signedIn() });
+  await assert.rejects(
+    plugin.addToPlaylist({ id: "pl", trackIds: [`local:${encodeURIComponent("spotify:local:x")}`] }),
+    { code: "unsupported", message: /local files/ },
+  );
+});

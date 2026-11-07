@@ -2,6 +2,23 @@
 
 在 [MyGo Music](https://github.com/egoist/mygo-music) 中浏览 Spotify 曲库和你的资料库，并通过 Spotify Connect 播放。需要 MyGo Music 0.1.22 及以上和 **Spotify Premium**。
 
+<table>
+  <tr>
+    <td colspan="2"><img src="screenshots/home.png" alt="首页：最近播放和你的热门歌曲"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">首页</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="screenshots/play.png" alt="正在播放：同步歌词"></td>
+    <td width="50%"><img src="screenshots/setting.png" alt="插件设置：Client ID 和 Soloist API Key"></td>
+  </tr>
+  <tr>
+    <td align="center">正在播放与同步歌词</td>
+    <td align="center">插件设置</td>
+  </tr>
+</table>
+
 ## 功能介绍和限制
 
 **功能**
@@ -43,7 +60,7 @@ Spotify 要求每位使用者用自己的开发者应用，只需配置一次：
 
 **为什么需要它**：Spotify 不向第三方应用提供音频，MyGo Music 只能遥控一台已登录的 Spotify 设备来播放。没有 Soloist 时，每次播放前都要先打开一个 Spotify 应用。
 
-**它是什么**：[Spotify Soloist](https://developer.spotify.com/documentation/soloist) 是 Spotify 官方的无界面播放器。插件在后台运行它，它在你的设备列表里显示为「MyGo Music on Mac」，直接在这台电脑上出声。这样不打开 Spotify 应用也能播放。支持 Apple 芯片的 Mac（macOS 13 及以上）和 x86_64 Windows。
+**它是什么**：[Spotify Soloist](https://developer.spotify.com/documentation/soloist) 是 Spotify 官方的无界面播放器。插件在后台运行它，它在你的设备列表里显示为「MyGo Music on Mac」，直接在这台电脑上出声。这样不打开 Spotify 应用也能播放。支持 Apple 芯片的 Mac（macOS 13 及以上）、x86_64 Windows，以及 x86_64 或 arm64 的 Linux（需要 PipeWire 或 PulseAudio）。
 
 **设置**（一次即可）：
 
@@ -51,7 +68,14 @@ Spotify 要求每位使用者用自己的开发者应用，只需配置一次：
 2. 在插件设置中允许 Spotify 插件运行程序。插件要用它从 Spotify 下载 Soloist（约 11 MB）并启动。Spotify 不允许转发 Soloist，所以插件不附带它。
 3. 保存 Key 后，在同一网络下打开手机或电脑上的 Spotify 应用，点「连接到设备」，选择「MyGo Music on Mac」（Windows 上是「MyGo Music on Windows」）完成配对。
 
-之后 Soloist 会自动登录，只在需要时启动，随 MyGo Music 关闭；它 90 天过期后插件会自动重新下载。播放器的设备菜单可以随时切换到其他 Spotify 设备，插件会记住你的选择。
+之后 Soloist 会自动登录，只在需要时启动，随 MyGo Music 关闭。构建 90 天过期时插件会自动换新；安装包会留在插件数据目录里，插件更新后直接用它重新装好，不需要重新下载。播放器的设备菜单可以随时切换到其他 Spotify 设备，插件会记住你的选择。
+
+**遇到问题时**：
+
+- 提示 Soloist 还在上一个 MyGo Music 会话中运行：先在活动监视器（Mac）或任务管理器（Windows）中退出旧的 MyGo Music 和 Soloist，再播放。
+- 下载或解压失败：检查网络或代理后重试。插件不会留下下载到一半的文件，稍后再点播放即可。
+- 更新插件前先暂停播放：Windows 上正在运行的 Soloist 可能让插件更新暂时失败，先退出内置播放器（或退出 MyGo Music）再更新。
+- 想让另一个 Spotify 账号使用内置播放器：退出登录会清除 Soloist 的配对，重新登录后再配对一次。
 
 注意：API Key 会出现在 Soloist 的启动参数中，这台电脑上以你的身份运行的其他程序能看到它。
 

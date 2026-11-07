@@ -8,10 +8,12 @@ the services it talks to or the software it downloads.
 
 The plugin doesn't include Spotify Soloist. When the listener uses the
 built-in player, it downloads the current build from Spotify
-(https://soloist-builds.spotifycdn.com/) into `soloist/` in the plugin's
-folder, as Spotify asks: its archives and binaries are not passed on. Soloist
-is Spotify's software, under Spotify's terms, with its own third-party
-licenses in `soloist/THIRD_PARTY_LICENSES.txt` once downloaded.
+(https://soloist-builds.spotifycdn.com/), keeps the archive in the plugin's
+data folder to install it again after a plugin update, and unpacks the binary
+into `soloist/` in the plugin's folder, as Spotify asks: its archives and
+binaries are not passed on. Soloist is Spotify's software, under Spotify's
+terms, with its own third-party licenses in `soloist/THIRD_PARTY_LICENSES.txt`
+once downloaded.
 
 Spotify names and content belong to Spotify AB. This plugin is not an
 official Spotify or MyGo Music release.

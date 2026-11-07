@@ -79,5 +79,11 @@
   "Spotify Soloist is starting. Play again in a moment.": "Spotify Soloist 正在启动，请稍后再点播放。",
   "To play on this computer without the Spotify app, add your Soloist API key in the plugin's settings.": "要在不打开 Spotify 应用的情况下在这台电脑上播放，请在插件设置中填写你的 Soloist API Key。",
   "Optional. Lets the plugin play on this computer through Spotify Soloist, Spotify's own player, without the Spotify app open. Generate the key with your Premium account in Spotify for Developers. Then pair it once: after saving the key, open the Spotify app on your phone or this computer, on the same network, and choose \"MyGo Music on Mac\" (\"MyGo Music on Windows\" on Windows) in its list of devices.": "可选。填写后，插件通过 Spotify 官方的 Soloist 播放器在这台电脑上播放，不必打开 Spotify 应用。用你的 Premium 账号在 Spotify for Developers 生成 Key。然后配对一次：保存 Key 后，在同一网络下打开手机或这台电脑上的 Spotify 应用，在设备列表中选择「MyGo Music on Mac」（Windows 上是「MyGo Music on Windows」）。",
-  "Couldn't load lyrics. Check your connection and try again.": "无法加载歌词，请检查网络后重试。"
+  "Couldn't load lyrics. Check your connection and try again.": "无法加载歌词，请检查网络后重试。",
+  "Spotify Soloist is still running from an earlier MyGo Music session. Quit MyGo Music and Soloist (Activity Monitor on a Mac, Task Manager on Windows), then play again.": "Spotify Soloist 还在上一个 MyGo Music 会话中运行。请先退出 MyGo Music 和 Soloist（Mac 上用「活动监视器」，Windows 上用「任务管理器」），再重新播放。",
+  "Spotify's Soloist build has expired. Try again in a moment.": "Spotify 当前版本的 Soloist 已过期。请稍后再试。",
+  "The downloaded Spotify Soloist can't run. Try again.": "下载的 Spotify Soloist 无法运行。请重试。",
+  "This version of the plugin can't start the programs it needs. Update the plugin, or update MyGo Music.": "这个版本的插件无法启动它需要的程序。请更新插件，或更新 MyGo Music。",
+  "Spotify can't find this. It may have been removed.": "Spotify 找不到这个内容。它可能已被移除。",
+  "Spotify can't add local files to a playlist through the Web API.": "Spotify 的 Web API 无法把本地文件加进歌单。"
 }

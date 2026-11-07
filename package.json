@@ -1,6 +1,6 @@
 {
   "name": "mygo-music-spotify",
-  "version": "0.4.2",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "Spotify for MyGo Music: catalog, library and playback through Spotify Connect.",

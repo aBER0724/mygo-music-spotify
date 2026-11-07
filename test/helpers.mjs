@@ -24,8 +24,12 @@ export const signedIn = (extra = {}) => ({
   expiresAt: Date.now() + 3600000, ...extra,
 });
 
-export async function setup(handler, { saved, settings = { clientId: CLIENT, soloistKey: "synthetic-soloist-key" }, redirect, spawn } = {}) {
-  const storage = new Map(saved ? [["session", structuredClone(saved)]] : []);
+export async function setup(handler, {
+  saved, settings = { clientId: CLIENT, soloistKey: "synthetic-soloist-key" },
+  redirect, spawn, platform = "darwin", arch = "arm64", store,
+} = {}) {
+  const storage = store || new Map();
+  if (saved) storage.set("session", structuredClone(saved));
   const reads = [];
   const calls = [];
   const opened = [];
@@ -41,7 +45,7 @@ export async function setup(handler, { saved, settings = { clientId: CLIENT, sol
     openURL: (url) => opened.push(url),
     signInPrompt: () => {},
     waitForRedirect: (options) => redirect(options, opened),
-    platform: "darwin", arch: "arm64", dataDir: "/data/spotify",
+    platform, arch, dataDir: "/data/spotify-connect",
     removeDataDir: (name) => removed.push(name),
     spawn: (command, args) => {
       if (!spawn) throw new Error(`fork/exec ${command}: no such file or directory`);
@@ -70,28 +74,63 @@ export const playing = (id) => json({ is_playing: true, progress_ms: 10, item: t
 
 // A fake Spotify Soloist, and the curl and tar that fetch it. Once running
 // and paired, it shows in Spotify's devices, until killed or it exits.
-export function program(lines = [], exitCode) {
+export function program(lines = [], exitCode, stderr = "") {
   let finish;
   const done = new Promise((resolve) => { finish = resolve; });
   const queue = [...lines];
   if (exitCode !== undefined) setTimeout(() => finish(exitCode), 0);
   return {
     pid: 1, readLine: async () => (queue.length ? queue.shift() : (await done, null)), wait: () => done,
-    kill: () => finish(0), errorOutput: () => "", write() {}, closeStdin() {}, done,
+    kill: () => finish(0), errorOutput: () => stderr, write() {}, closeStdin() {}, done,
   };
 }
 
-export function fakeSoloist({ installed = true, paired = true, expireOnce = false, exitWith } = {}) {
-  const state = { installed, paired, spawns: [], current: null, killed: false };
+export function fakeSoloist({
+  installed = true, paired = true, expireOnce = false, expireText = false, exitWith,
+  staged = false, buildAge = 0, versionFails = false, announceId = true,
+  curlFails = false, tarFails = false, cdnStale = false,
+  thenExitWith, lockOnce = false, binary = "soloist/soloist",
+} = {}) {
+  const state = {
+    installed, paired, staged, spawns: [], current: null, killed: false,
+    buildAge, versionFails, announceId, curlFails, tarFails, cdnStale, binary,
+  };
+  const version = () => `soloist 1.3.10.51 build ${Math.floor((Date.now() - state.buildAge) / 1000)} (20261106) (macos/aarch64)`;
   state.spawn = (command, args) => {
     state.spawns.push({ command, args });
-    if (command === "curl") return program([], 0);
-    if (command === "tar") { state.installed = true; return program([], 0); }
-    assert.equal(command, "soloist/soloist");
-    if (!state.installed) throw new Error("fork/exec soloist/soloist: no such file or directory");
-    if (expireOnce && !state.expired) { state.expired = true; return program(["client expired"], 10); }
+    if (command === "curl") {
+      if (state.curlFails) return program(["curl: (28) Connection timed out"], 28, "curl: (28) Connection timed out after 20001 milliseconds");
+      state.staged = true;
+      // A build downloaded now is fresh, unless the CDN serves a stale one.
+      if (!state.cdnStale) state.buildAge = 0;
+      return program([], 0);
+    }
+    if (command === "tar") {
+      if (state.tarFails) return program([], 2, "tar: Error exit delayed from previous errors.");
+      // No archive to unpack until one is downloaded.
+      if (!state.staged) return program([], 2, "tar: Cannot open: No such file or directory");
+      state.installed = true;
+      return program([], 0);
+    }
+    assert.equal(command, state.binary);
+    if (args[0] === "--version") {
+      if (!state.installed || state.versionFails) return program(["soloist: not a valid executable"], 1);
+      return program([version()], 0);
+    }
+    if (!state.installed) throw new Error(`fork/exec ${state.binary}: no such file or directory`);
+    if (lockOnce && !state.locked) {
+      state.locked = true;
+      return program([], 1, 'Error: another session is running for data directory "/data/spotify/soloist".');
+    }
+    if (expireOnce && !state.expired) {
+      state.expired = true;
+      return program(["client expired, please update to a newer version. Exiting with exit code 10"], expireText ? 1 : 10);
+    }
+    if (state.expired && thenExitWith) {
+      return program([`2026-11-08 02:19:20.364: ${thenExitWith}`], 1);
+    }
     if (exitWith) return program(["2026-11-08 02:19:20.363: soloist 1.3.10", `2026-11-08 02:19:20.364: ${exitWith}`], 1);
-    const run = program([`2026-11-08 02:19:20.388: ready, device_name=${args[1]} device_id=soloist-id`,
+    const run = program([`2026-11-08 02:19:20.388: ready, device_name=${args[1]}${state.announceId ? " device_id=soloist-id" : ""}`,
       ...(state.paired ? [] : [`2026-11-08 02:19:20.389: waiting for login — connect to "${args[1]}" from your Spotify app`])]);
     const kill = run.kill;
     run.kill = () => { state.killed = true; kill(); };
@@ -108,7 +147,10 @@ export function fakeSoloist({ installed = true, paired = true, expireOnce = fals
 // Polls run at once; a command's wait for the built-in player is short.
 export function fastPolling(t) {
   const timer = globalThis.setTimeout;
-  t.mock.method(globalThis, "setTimeout", (fn, ms, ...args) => timer(fn, ms === 500 || ms === 1500 ? 0 : ms === 10000 ? 60 : ms, ...args));
+  t.mock.method(globalThis, "setTimeout", (fn, ms, ...args) => {
+    const fixed = ms === 10000 ? 60 : [500, 1500, 3000, 5000, 6000, 30000].includes(ms) ? 0 : ms;
+    return timer(fn, fixed, ...args);
+  });
 }
 
 export const noDeviceThenSoloist = (player, others = []) => {
