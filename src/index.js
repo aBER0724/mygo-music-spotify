@@ -979,6 +979,10 @@ const PLAYER_SCOPE = "streaming";
 const SPCLIENT = "https://spclient.wg.spotify.com";
 const ROWS_PAGE = 200; // spclient truncates a longer range of rows
 const METADATA_BATCH = 500; // songs per /extended-metadata request
+// The kinds Spotify's own clients ask /extended-metadata for.
+const ARTIST_V4 = 8;
+const ALBUM_V4 = 9;
+const TRACK_V4 = 10;
 const SPCLIENT_PARALLEL = 4; // requests in flight at once
 const TRACK_TTL = 30 * 60 * 1000;
 const TRACK_CACHE_MAX = 4000;
@@ -1098,7 +1102,7 @@ function playerToken(prompt) {
   return promise;
 }
 
-// --- Protobuf, as much of it as these three answers need -----------------
+// --- Protobuf, as much of it as these answers need ----------------------
 
 function pbVarint(value) {
   const bytes = [];
@@ -1192,12 +1196,12 @@ function base62(bytes) {
 const hexOf = (bytes) => Array.from(bytes || [], (byte) => byte.toString(16).padStart(2, "0")).join("");
 
 // The country whose charts to read. Spotify's own clients take it from the
-// account, which the Web API no longer tells, so it is a setting here, and
-// US when it is empty or not a country code.
-const DEFAULT_MARKET = "US";
+// account, which the Web API no longer tells, so a listener who wants another
+// country's charts names it in the settings, and the session's own answer
+// stands when they don't.
 function market() {
   const value = String(host.setting("market") || "").trim().toUpperCase();
-  return /^[A-Z]{2}$/.test(value) ? value : DEFAULT_MARKET;
+  return /^[A-Z]{2}$/.test(value) ? value : "";
 }
 
 // The 16 bytes behind an ID's 22 base62 digits: the request that asks for
@@ -1343,7 +1347,8 @@ function trackFrom(uri, fields) {
   };
 }
 
-// A song's album pictures, from the largest of the group Spotify labels.
+// A song's album picture, from the size Spotify labels large: a row shows it
+// a few dozen points wide, and the largest is a few times the bytes for it.
 function coverOf(album) {
   const group = pbFirst(album, 17);
   const images = group
@@ -1351,7 +1356,8 @@ function coverOf(album) {
     : pbAll(album, 9).map((image) => pbRead(image));
   const usable = images.filter((image) => pbFirst(image, 1)?.length);
   if (!usable.length) return "";
-  const pick = usable.find((image) => pbFirst(image, 2) === 3) || usable[0];
+  const size = (image) => pbFirst(image, 2);
+  const pick = usable.find((image) => size(image) === 2) || usable.find((image) => size(image) === 3) || usable[0];
   return `https://i.scdn.co/image/${hexOf(pbFirst(pick, 1))}`;
 }
 
@@ -1384,26 +1390,77 @@ function albumFrom(uri, fields) {
   };
 }
 
+// The messages behind a batch of uris, read the way Spotify's own clients read
+// them: one POST carries up to METADATA_BATCH uris and an extension kind, and
+// the country heads the request so the charts inside an artist answer for the
+// market in the settings. Each answer wraps the entity's own message in bytes.
+async function extendedMetadata(kind, uris, country, prompt) {
+  const request = pbJoin([
+    ...(country ? [pbBytes(1, pbString(1, country))] : []),
+    ...uris.map((uri) => pbBytes(2, pbJoin([pbString(1, uri), pbBytes(2, pbInt(1, kind))]))),
+  ]);
+  const fields = pbRead(await spclient("POST", "/extended-metadata/v0/extended-metadata", request, prompt));
+  const messages = new Map();
+  for (const array of pbAll(fields, 2)) {
+    for (const entity of pbAll(pbRead(array), 3)) {
+      const data = pbRead(entity);
+      const uri = pbText(pbFirst(data, 2));
+      const any = pbFirst(data, 3);
+      const message = any ? pbFirst(pbRead(any), 2) : undefined;
+      if (uri && message) messages.set(uri, pbRead(message));
+    }
+  }
+  return messages;
+}
+
 async function readAlbums(uris) {
   const albums = [];
   for (const batch of chunks(uris, METADATA_BATCH)) {
-    const request = pbJoin(batch.map((uri) => pbBytes(2, pbJoin([
-      pbString(1, uri),
-      pbBytes(2, pbInt(1, 9)), // ALBUM_V4
-    ]))));
-    const fields = pbRead(await spclient("POST", "/extended-metadata/v0/extended-metadata", request));
-    for (const array of pbAll(fields, 2)) {
-      for (const entity of pbAll(pbRead(array), 3)) {
-        const data = pbRead(entity);
-        const uri = pbText(pbFirst(data, 2));
-        const any = pbFirst(data, 3);
-        const message = any ? pbFirst(pbRead(any), 2) : undefined;
-        if (!uri || !message) continue;
-        albums.push(albumFrom(uri, pbRead(message)));
-      }
-    }
+    for (const [uri, fields] of await extendedMetadata(ALBUM_V4, batch)) albums.push(albumFrom(uri, fields));
   }
   return albums.filter((album) => album.name);
+}
+
+// The session's own search, over the context Spotify's clients read an artist
+// with. A Development Mode app's Web API search is a narrow index, where an
+// artist's name can miss every song of theirs; this one names them by uri
+// alone, so their details come from the batches above.
+async function sessionSearch(query) {
+  const path = `/context-resolve/v1/spotify:search:${encodeURIComponent(query).replace(/%20/g, "+")}`;
+  const body = JSON.parse(decoder.decode(await spclient("GET", path)));
+  const pages = Array.isArray(body?.pages) ? body.pages : [];
+  return pages.flatMap((page) => (page?.tracks || []).map((track) => track?.uri)).filter(Boolean);
+}
+
+// An artist's own context, as Spotify's clients read it: their most popular
+// songs and then their latest album's, named by uri alone. The rest of its
+// pages are the albums, a request each, and those are the albums section's.
+async function artistContextSongs(id) {
+  const body = JSON.parse(decoder.decode(await spclient("GET", `/context-resolve/v1/spotify:artist:${id}`)));
+  const artistUri = `spotify:artist:${id}`;
+  return (Array.isArray(body?.pages) ? body.pages : [])
+    .flatMap((page) => page?.tracks || [])
+    .filter((track) => !track?.metadata?.artist_uri || track.metadata.artist_uri === artistUri)
+    .map((track) => track?.uri)
+    .filter(Boolean);
+}
+
+// The popular songs of one country, as the artist's metadata lists them: a
+// market Spotify lists no songs for falls back to the worldwide ranking and
+// then to the longest list, the way Spotify's own table does. They are named
+// by gid, so their details come from the batch every song of the page is read
+// in.
+function chartUris(fields, country) {
+  const lists = pbAll(fields, 4).map((top) => pbRead(top)).filter((top) => pbAll(top, 2).length);
+  const countryOf = (top) => pbText(pbFirst(top, 1));
+  const longest = (a, b) => (pbAll(b, 2).length > pbAll(a, 2).length ? b : a);
+  const chosen = (country && lists.find((top) => countryOf(top) === country))
+    || lists.find((top) => countryOf(top) === "ZZ")
+    || lists.reduce(longest, lists[0]);
+  if (!chosen) return [];
+  return pbAll(chosen, 2)
+    .map((track) => `spotify:track:${base62(pbFirst(pbRead(track), 1))}`)
+    .filter((uri) => uri !== "spotify:track:");
 }
 
 async function readTracks(uris) {
@@ -1416,20 +1473,8 @@ async function readTracks(uris) {
   const batch = wanted.filter((uri) => stale.has(uri));
   for (let i = 0; i < batch.length; i += METADATA_BATCH) batches.push(batch.slice(i, i + METADATA_BATCH));
   await Promise.all(batches.map(async (batch) => {
-    const request = pbJoin(batch.map((uri) => pbBytes(2, pbJoin([
-      pbString(1, uri),
-      pbBytes(2, pbInt(1, 10)), // TRACK_V4
-    ]))));
-    const fields = pbRead(await spclient("POST", "/extended-metadata/v0/extended-metadata", request));
-    for (const array of pbAll(fields, 2)) {
-      for (const entity of pbAll(pbRead(array), 3)) {
-        const data = pbRead(entity);
-        const uri = pbText(pbFirst(data, 2));
-        const any = pbFirst(data, 3);
-        const message = any ? pbFirst(pbRead(any), 2) : undefined;
-        if (!uri || !message) continue;
-        trackCache.set(uri, { track: trackFrom(uri, pbRead(message)), at: Date.now() });
-      }
+    for (const [uri, fields] of await extendedMetadata(TRACK_V4, batch)) {
+      trackCache.set(uri, { track: trackFrom(uri, fields), at: Date.now() });
     }
   }));
   while (trackCache.size > TRACK_CACHE_MAX) trackCache.delete(trackCache.keys().next().value);
@@ -1483,50 +1528,79 @@ function portraitOf(fields) {
   return `https://i.scdn.co/image/${hexOf(pbFirst(pick, 1))}`;
 }
 
-// The popular songs of one country, as the artist's metadata lists them. A
-// market Spotify lists no songs for falls back to the worldwide ranking, the
-// way Spotify's own table does.
-function chartUris(fields, country) {
-  const lists = pbAll(fields, 4).map((top) => pbRead(top));
-  const chosen = lists.find((top) => pbText(pbFirst(top, 1)) === country)
-    || lists.find((top) => pbText(pbFirst(top, 1)) === "ZZ")
-    || lists[0];
-  if (!chosen) return [];
-  return pbAll(chosen, 2)
-    .map((track) => base62(pbFirst(pbRead(track), 1)))
-    .filter(Boolean)
-    .map((gid) => `spotify:track:${gid}`);
+// The chart the settings name, from the one route that takes a country: the
+// extension Spotify's clients ask for answers for the account's own country
+// whatever it is told, and this route is what names another. Null when it
+// names no chart at all, so the artist's own answer stands in.
+async function playerChart(id, country) {
+  const fields = pbRead(await spclient("GET", `/metadata/4/artist/${gidOf(id)}?country=${country}`));
+  return pbAll(fields, 4).length ? fields : null;
 }
 
 // A whole artist page from Spotify's own metadata, which answers without the
 // Web API's quota: who they are, their portrait, their albums and singles, and
-// the popular songs of the country in the settings. Null when the listener
-// has turned the approval down this run. A page without the approval asks for
-// it once, and asks again when Spotify withdraws one it gave.
+// their songs. The chart leads, then the songs it leaves out: their own
+// context adds the latest album's, and the session's search finds the rest of
+// their most played. Requests that don't wait on each other go out together,
+// so the page arrives in as few round trips as its answers allow. Null when
+// the listener has turned the approval down this run; a page without the
+// approval asks for it once, and again when Spotify withdraws one it gave.
 async function playerArtist(id, needAlbums = true, retried = false) {
   const country = market();
   if (playerRefused && !currentPlayer()) return null;
+  const uri = `spotify:artist:${id}`;
   let fields;
   try {
-    fields = pbRead(await spclient("GET", `/metadata/4/artist/${gidOf(id)}?country=${country}`,
-      undefined, t("The popular songs on an artist's page need one more Spotify approval. Close the page to skip.")));
+    fields = (await extendedMetadata(ARTIST_V4, [uri], country,
+      t("The popular songs on an artist's page need one more Spotify approval. Close the page to skip."))).get(uri);
   } catch (error) {
     if (error?.code === "playerRevoked" && !retried) return playerArtist(id, needAlbums, true);
     // The approval declined or timed out: no browser window again this run.
     if (!currentPlayer()) playerRefused = true;
     throw error;
   }
+  if (!fields) return null;
   const name = pbText(pbFirst(fields, 2));
   if (!name) return null;
+  // A country in the settings is asked for on its own: the answer above is
+  // the account's own charts. A page that can't get it keeps that one.
+  const charts = country ? (await playerChart(id, country).catch(() => null)) || fields : fields;
+  const chart = chartUris(charts, country);
   const albumIds = [...pbAll(fields, 5), ...pbAll(fields, 6)]
     .flatMap((group) => pbAll(pbRead(group), 1))
     .map((album) => base62(pbFirst(pbRead(album), 1)))
     .filter(Boolean);
-  const albums = needAlbums && albumIds.length
-    ? await readAlbums(albumIds.map((album) => `spotify:album:${album}`))
-    : [];
-  const uris = chartUris(fields, country);
-  const tracks = uris.length ? (await readTracks(uris)).tracks : [];
+  // The chart's own details name the song the search leans on, so they, the
+  // context and the name go out at once.
+  const [chartRead, contextUris, namedUris] = await Promise.all([
+    chart.length ? readTracks(chart) : { tracks: [] },
+    artistContextSongs(id).catch(() => []),
+    sessionSearch(name).catch(() => []),
+  ]);
+  const songName = chartRead.tracks.find((track) => !track.unavailable)?.name;
+  const songUris = songName ? await sessionSearch(songName).catch(() => []) : [];
+  const beyond = [...new Set([...contextUris, ...namedUris, ...songUris])].filter((uri) => !chart.includes(uri));
+  const [beyondRead, albums] = await Promise.all([
+    beyond.length ? readTracks(beyond) : { tracks: [] },
+    // The Web API's albums come first; these only stand in when it had none.
+    needAlbums && albumIds.length ? readAlbums(albumIds.map((album) => `spotify:album:${album}`)) : [],
+  ]);
+  // The chart keeps its order; the rest are only songs the artist is credited
+  // on, and no title is listed twice.
+  const titles = new Set();
+  const tracks = [];
+  const rows = [
+    ...chartRead.tracks.map((track) => ({ track, own: false })),
+    ...beyondRead.tracks.map((track) => ({ track, own: true })),
+  ];
+  for (const { track, own } of rows) {
+    if (track.unavailable) continue;
+    if (own && !track.artists?.some((artist) => artist.id === id)) continue;
+    const title = String(track.name || "").toLowerCase();
+    if (!title || titles.has(title)) continue;
+    titles.add(title);
+    tracks.push(track);
+  }
   return { artist: { id, name, imageUrl: portraitOf(fields) }, tracks, albums };
 }
 
@@ -1716,9 +1790,10 @@ async function artistAlbums(id) {
   }
 }
 
-// An artist page is four reads over the Web API, two of them searches, and a
-// Development Mode app's quota is small. Spotify turning one of them down for
-// a moment shouldn't cost the listener the whole page, so a section it limits
+// An artist page reads the artist and their albums over the Web API, and
+// searches it for their songs when the session can't name them. A Development
+// Mode app's quota is small, and Spotify turning one of these down for a
+// moment shouldn't cost the listener the whole page, so a section it limits
 // stays empty and the page shows the rest. A spent quota is handed to noted,
 // so the page can say why the section is empty.
 async function unlessLimited(task, fallback, noted) {
@@ -1770,6 +1845,8 @@ export async function artist({ id }) {
   const played = await playerArtist(id, !albums.length).catch(() => null);
   if (!data && !played) throw limited || fail("unavailable", t("This artist isn't available."));
   const result = data ? { ...toArtist(data), following } : { ...played.artist, following: false };
+  // The session's own page carries the artist's songs, their charts first. A
+  // page without the approval it needs falls back to the Web API's search.
   const tracks = played?.tracks?.length
     ? played.tracks
     : await unlessLimited(() => artistTracks(result), [], (error) => { tracksSpent = error; });

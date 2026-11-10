@@ -31,7 +31,7 @@
     {
       "key": "market",
       "label": "Chart country",
-      "help": "Optional. Two-letter country code, such as JP, US or HK, for the popular songs on an artist's page. Empty means US."
+      "help": "Optional. Two-letter country code, such as JP, US or HK, for the popular songs on an artist's page. Empty shows the charts of the country your account is in."
     },
     {
       "key": "soloistKey",

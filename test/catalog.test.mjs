@@ -278,6 +278,18 @@ const base62Of = (bytes) => {
   return digits.reverse().map((digit) => BASE62_DIGITS[digit]).join("").padStart(22, "0");
 };
 const metadataAnswer = (entries) => pbJoin(entries.map((message) => pbBytes(2, message)));
+// The kinds /extended-metadata is asked for, and what a request says.
+const ARTIST_V4 = 8;
+const ALBUM_V4 = 9;
+const TRACK_V4 = 10;
+const extensionKindOf = (body) => {
+  const bytes = Array.from(body || []);
+  const at = bytes.findIndex((byte, index) => byte === 0x08 && [ARTIST_V4, ALBUM_V4, TRACK_V4].includes(bytes[index + 1]));
+  return at < 0 ? 0 : bytes[at + 1];
+};
+const carriesCountry = (body, country) => Buffer.from(body || []).includes(Buffer.from(pbString(1, country)));
+// An artist's own metadata, wrapped the way /extended-metadata answers it.
+const artistAnswer = (id, message) => bytes(metadataAnswer([entity(`spotify:artist:${id}`, message)]));
 
 test("a playlist the Web API withholds is read from the player identity", async () => {
   const first = "0qMZXgcLfkl5RI3q50KHMH";
@@ -341,6 +353,35 @@ test("a playlist the Web API withholds is read from the player identity", async 
   assert.equal(metadata[0].headers["Content-Type"], "application/x-protobuf");
 });
 
+// A row shows its cover a few dozen points wide: the size Spotify labels
+// large is the one it gets, not the largest, which is several times the bytes.
+test("a song row takes the large cover, not the largest", async () => {
+  const LARGE = Uint8Array.from([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc]);
+  const XLARGE = Uint8Array.from([0xdd, 0xee, 0xff, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01]);
+  const hex = (bytes) => Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const song = "0qMZXgcLfkl5RI3q50KHMH";
+  const store = new Map([["player", {
+    accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
+  }]]);
+  const { plugin } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/me") return json(me);
+    if (path === "/v1/playlists/theirs") {
+      return json({ id: "theirs", name: "Theirs", owner: { id: "other" }, items: { total: 1 } });
+    }
+    if (path === "/playlist/v2/playlist/theirs") return bytes(playlistRows([`spotify:track:${song}`]));
+    return bytes(metadataAnswer([entity(`spotify:track:${song}`, pbJoin([
+      pbString(2, "Song"),
+      pbBytes(3, pbJoin([pbBytes(17, pbJoin([
+        pbBytes(1, pbJoin([pbBytes(1, XLARGE), pbInt(2, 3)])),
+        pbBytes(1, pbJoin([pbBytes(1, LARGE), pbInt(2, 2)])),
+      ]))])),
+    ]))]));
+  }, { saved: signedIn(), store });
+
+  const list = await plugin.playlist({ id: "theirs" });
+  assert.equal(list.tracks[0].album.imageUrl, `https://i.scdn.co/image/${hex(LARGE)}`);
+});
 test("a listener who never approves the player identity keeps the note", async () => {
   const { plugin } = await setup((call) => {
     if (call.url.pathname === "/v1/me") return json(me);
@@ -358,11 +399,18 @@ test("a listener who never approves the player identity keeps the note", async (
   assert.deepEqual(again.tracks, []);
 });
 
-test("a chart country reads the artist's popular songs over the session", async () => {
-  const popular = "0qMZXgcLfkl5RI3q50KHMH";
-  // The same ID as the 16 bytes an artist's chart is made of.
-  const POPULAR_GID = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
+test("a chart country is asked for on its own, and wins", async () => {
+  const song = (gid, name) => pbJoin([
+    pbBytes(1, gid),
+    pbString(2, name),
+    pbBytes(3, pbJoin([pbString(2, "Album")])),
+    pbBytes(4, pbJoin([pbString(2, "Artist")])),
+    pbSint(7, 120000),
+  ]);
+  const ACCOUNT_GID = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
     0x84, 0xd3, 0xaa, 0xb8, 0x16, 0xad, 0x40, 0x67]);
+  const WANTED_GID = Uint8Array.from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
   const store = new Map([["player", {
     accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
   }]]);
@@ -373,36 +421,48 @@ test("a chart country reads the artist's popular songs over the session", async 
     if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3/albums") return json({ items: [], next: null });
     if (path === "/v1/me/library/contains") return json([false]);
     if (path === "/v1/search") { searched.push(call); return json({ tracks: { items: [], next: null } }); }
-    if (path === "/metadata/4/artist/e04de8ad658745069acb1691368654cf") {
+    // The session's own search finds nothing here.
+    if (path.startsWith("/context-resolve/")) return bytes(new TextEncoder().encode(JSON.stringify({ pages: [] })));
+    // The country-by-gid route answers the chart of the country it is asked for.
+    if (path.startsWith("/metadata/4/artist/")) {
       return bytes(pbJoin([
-        pbString(2, "Artist"), pbBytes(17, pbBytes(1, pbJoin([pbBytes(1, COVER), pbInt(2, 3)]))),
-        pbBytes(4, pbJoin([
-          pbString(1, "US"), pbBytes(2, pbJoin([pbBytes(1, POPULAR_GID)]))])),
-        pbBytes(4, pbJoin([
-          pbString(1, "JP"), pbBytes(2, pbJoin([pbBytes(1, POPULAR_GID)]))])),
+        pbString(2, "Artist"),
+        pbBytes(4, pbJoin([pbString(1, "JP"),
+          pbBytes(2, song(WANTED_GID, "JP Song"))])),
       ]));
     }
-    if (path === "/extended-metadata/v0/extended-metadata") {
-      return bytes(metadataAnswer([entity(`spotify:track:${popular}`, pbJoin([
-        pbString(2, "Popular Song"),
-        pbBytes(3, pbJoin([pbString(2, "Album")])),
-        pbBytes(4, pbJoin([pbString(2, "Artist")])),
-        pbSint(7, 120000),
-      ]))]));
+    // The chart's row names its song by gid, so the page reads its details.
+    if (path === "/extended-metadata/v0/extended-metadata" && extensionKindOf(call.body) === TRACK_V4) {
+      return bytes(metadataAnswer([entity(`spotify:track:${base62Of(WANTED_GID)}`, song(WANTED_GID, "JP Song"))]));
     }
-    throw new Error(`unexpected ${path}`);
+    // The extension answers for the account's own country, whatever it is told.
+    return artistAnswer("6PfSUFtkMVoDkx4MQkzOi3", pbJoin([
+      pbString(2, "Artist"), pbBytes(17, pbBytes(1, pbJoin([pbBytes(1, COVER), pbInt(2, 3)]))),
+      pbBytes(4, pbJoin([pbString(1, "IN"), pbBytes(2, song(ACCOUNT_GID, "Account Song"))])),
+    ]));
   }, { saved: signedIn(), store, settings: { clientId: "0123456789abcdef0123456789abcdef", market: "jp" } });
 
   const page = await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
-  assert.deepEqual(page.tracks.map((song) => song.id), [popular]);
-  // The country in the setting chose the list, and no search was made.
-  assert.deepEqual(searched, []);
-  const artist = calls.find((call) => call.url.pathname.startsWith("/metadata/4/artist/"));
-  assert.equal(artist.url.searchParams.get("country"), "JP");
-  assert.equal(artist.headers.Authorization, "Bearer player-access");
+  assert.deepEqual(page.tracks.map((song) => song.name), ["JP Song"]);
+  assert.deepEqual(page.tracks.map((song) => song.id), [base62Of(WANTED_GID)]);
+  assert.equal(page.tracks[0].duration, 120000);
+  // The page took its songs from the session, so the Web API's own search
+  // wasn't needed.
+  assert.equal(searched.length, 0);
+  const reads = calls.filter((call) => call.url.host === "spclient.wg.spotify.com");
+  const artistRead = reads.find((call) => call.method === "POST");
+  assert.equal(extensionKindOf(artistRead.body), ARTIST_V4);
+  const chartRead = reads.find((call) => call.url.pathname.startsWith("/metadata/4/artist/"));
+  assert.equal(chartRead.url.searchParams.get("country"), "JP");
+  assert.equal(chartRead.headers.Authorization, "Bearer player-access");
+  assert.ok(reads.some((call) => call.url.pathname.startsWith("/context-resolve/v1/spotify:search:")));
 });
 
-test("with no chart country set, an artist page reads the US chart", async () => {
+test("with no chart country set, the request names none", async () => {
+  const american = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
+    0x84, 0xd3, 0xaa, 0xb8, 0x16, 0xad, 0x40, 0x67]);
+  const worldwide = Uint8Array.from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
   const store = new Map([["player", {
     accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
   }]]);
@@ -412,12 +472,34 @@ test("with no chart country set, an artist page reads the US chart", async () =>
     if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3/albums") return json({ items: [], next: null });
     if (path === "/v1/me/library/contains") return json([false]);
     if (path === "/v1/search") return json({ tracks: { items: [], next: null } });
-    if (path.startsWith("/metadata/4/artist/")) return bytes(pbJoin([pbString(2, "Artist")]));
+    // The rows name their songs by gid, so the page reads their details.
+    if (extensionKindOf(call.body) === TRACK_V4) {
+      return bytes(metadataAnswer([
+        entity(`spotify:track:${base62Of(american)}`, pbJoin([pbString(2, "US Song")])),
+        entity(`spotify:track:${base62Of(worldwide)}`, pbJoin([pbString(2, "Worldwide Song")])),
+      ]));
+    }
+    if (extensionKindOf(call.body) === ARTIST_V4) {
+      return artistAnswer("6PfSUFtkMVoDkx4MQkzOi3", pbJoin([
+        pbString(2, "Artist"),
+        pbBytes(4, pbJoin([pbString(1, "US"), pbBytes(2, pbBytes(1, american))])),
+        pbBytes(4, pbJoin([pbString(1, "ZZ"), pbBytes(2, pbBytes(1, worldwide))])),
+      ]));
+    }
+    // No country in the settings means no chart route to ask.
+    return bytes(new TextEncoder().encode(JSON.stringify({ pages: [] })));
     throw new Error(`unexpected ${path}`);
   }, { saved: signedIn(), store, settings: { clientId: "0123456789abcdef0123456789abcdef", market: "" } });
-  await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
-  const artist = calls.find((call) => call.url.pathname.startsWith("/metadata/4/artist/"));
-  assert.equal(artist.url.searchParams.get("country"), "US");
+
+  const page = await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
+  // No country in the settings leaves the request without one, so the session
+  // answers for the account's own country, as Spotify's clients ask it.
+  const artist = calls.find((call) => call.url.pathname === "/extended-metadata/v0/extended-metadata");
+  assert.equal(Array.from(artist.body)[0], 0x12);
+  assert.ok(!carriesCountry(artist.body, "US"));
+  // A list for the country in the settings is what the page shows, and the
+  // worldwide one stands in when no list names it.
+  assert.deepEqual(page.tracks.map((t) => t.name), ["Worldwide Song"]);
 });
 
 // Spotify can revoke the player approval. The artist page then asks for a
@@ -445,12 +527,17 @@ test("a revoked player approval is asked for again by the artist page", async ()
     if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3") return json({ id: "6PfSUFtkMVoDkx4MQkzOi3", name: "Artist" });
     if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3/albums") return json({ items: [], next: null });
     if (path === "/v1/me/library/contains") return json([false]);
-    if (path === "/metadata/4/artist/e04de8ad658745069acb1691368654cf") {
-      return bytes(pbJoin([pbString(2, "Artist"),
-        pbBytes(4, pbJoin([pbString(1, "JP"), pbBytes(2, pbJoin([pbBytes(1, POPULAR_GID)]))]))]));
+    if (path === "/v1/search") return json({ tracks: { items: [], next: null } });
+    if (path.startsWith("/context-resolve/")) return bytes(new TextEncoder().encode(JSON.stringify({ pages: [] })));
+    if (extensionKindOf(call.body) === TRACK_V4) {
+      return bytes(metadataAnswer([entity(`spotify:track:${base62Of(POPULAR_GID)}`, pbJoin([
+        pbString(2, "Popular Song"), pbSint(7, 1000)]))]));
     }
-    if (path === "/extended-metadata/v0/extended-metadata") {
-      return bytes(metadataAnswer([entity(`spotify:track:${popular}`, pbJoin([pbString(2, "Popular Song"), pbSint(7, 1000)]))]));
+    if (extensionKindOf(call.body) === ARTIST_V4) {
+      return artistAnswer("6PfSUFtkMVoDkx4MQkzOi3", pbJoin([
+        pbString(2, "Artist"),
+        pbBytes(4, pbJoin([pbString(1, "JP"), pbBytes(2, pbBytes(1, POPULAR_GID))])),
+      ]));
     }
     throw new Error(`unexpected ${path}`);
   }, {
@@ -469,7 +556,7 @@ test("a revoked player approval is asked for again by the artist page", async ()
   assert.equal(opened.length, 1);
   assert.match(prompts[0], /popular songs on an artist's page/);
   assert.equal(store.get("player").refreshToken, "new-refresh");
-  const artist = calls.find((call) => call.url.pathname.startsWith("/metadata/4/artist/"));
+  const artist = calls.find((call) => call.url.pathname === "/extended-metadata/v0/extended-metadata");
   assert.equal(artist.headers.Authorization, "Bearer new-access");
 });
 
@@ -495,7 +582,6 @@ test("an artist page turned down for the approval falls back to search once", as
 });
 
 test("an artist page comes from the session when the quota is spent", async () => {
-  const song = "0qMZXgcLfkl5RI3q50KHMH";
   const POPULAR = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
     0x84, 0xd3, 0xaa, 0xb8, 0x16, 0xad, 0x40, 0x67]);
   const ALBUM = Uint8Array.from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
@@ -503,34 +589,32 @@ test("an artist page comes from the session when the quota is spent", async () =
   const store = new Map([["player", {
     accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
   }]]);
-  const kindOf = (body) => {
-    const bytes = Array.from(body || []);
-    const at = bytes.findIndex((byte, index) => byte === 0x08 && (bytes[index + 1] === 9 || bytes[index + 1] === 10));
-    return at < 0 ? 0 : bytes[at + 1];
-  };
   const { plugin } = await setup((call) => {
     if (call.url.host === "api.spotify.com") {
       return json({ error: { status: 429, message: "Too many requests", reason: "QUOTA_EXCEEDED" } }, 429);
     }
-    if (call.url.pathname === "/metadata/4/artist/e04de8ad658745069acb1691368654cf") {
-      return bytes(pbJoin([
-        pbString(2, "Artist"),
-        pbBytes(17, pbBytes(1, pbJoin([pbBytes(1, COVER), pbInt(2, 3)]))),
-        pbBytes(5, pbBytes(1, pbJoin([pbBytes(1, ALBUM)]))),
-        pbBytes(4, pbJoin([pbString(1, "JP"), pbBytes(2, pbJoin([pbBytes(1, POPULAR)]))])),
-      ]));
-    }
-    if (kindOf(call.body) === 9) {
+    // The artist's answer names its albums and songs by gid alone, so the page
+    // fills both in with a batch each, whether the Web API's quota is spent or
+    // not.
+    if (extensionKindOf(call.body) === ALBUM_V4) {
       return bytes(metadataAnswer([entity(`spotify:album:${base62Of(ALBUM)}`, pbJoin([
         pbString(2, "Album"),
         pbBytes(17, pbBytes(1, pbJoin([pbBytes(1, COVER), pbInt(2, 3)]))),
       ]))]));
     }
-    return bytes(metadataAnswer([entity(`spotify:track:${song}`, pbJoin([
-      pbString(2, "Popular Song"),
-      pbBytes(4, pbJoin([pbString(2, "Artist")])),
-      pbSint(7, 120000),
-    ]))]));
+    if (extensionKindOf(call.body) === TRACK_V4) {
+      return bytes(metadataAnswer([entity(`spotify:track:${base62Of(POPULAR)}`, pbJoin([
+        pbString(2, "Popular Song"),
+        pbBytes(4, pbJoin([pbString(2, "Artist")])),
+        pbSint(7, 120000),
+      ]))]));
+    }
+    return artistAnswer("6PfSUFtkMVoDkx4MQkzOi3", pbJoin([
+      pbString(2, "Artist"),
+      pbBytes(17, pbBytes(1, pbJoin([pbBytes(1, COVER), pbInt(2, 3)]))),
+      pbBytes(5, pbBytes(1, pbBytes(1, ALBUM))),
+      pbBytes(4, pbJoin([pbString(1, "JP"), pbBytes(2, pbBytes(1, POPULAR))])),
+    ]));
   }, { saved: signedIn(), store, settings: { clientId: "0123456789abcdef0123456789abcdef", market: "JP" } });
 
   const page = await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
@@ -538,38 +622,207 @@ test("an artist page comes from the session when the quota is spent", async () =
   assert.match(page.artist.imageUrl, /^https:\/\/i\.scdn\.co\/image\//);
   assert.deepEqual(page.tracks.map((t) => t.name), ["Popular Song"]);
   assert.deepEqual(page.albums.map((a) => a.name), ["Album"]);
+  // The album's gid is the ID the app shows, as the Web API's albums are.
+  assert.deepEqual(page.albums.map((a) => a.id), [base62Of(ALBUM)]);
+  assert.equal(page.albums[0].imageUrl, "https://i.scdn.co/image/deadbeefdeadbeefdeadbeef");
 });
 
 test("with a country set, the charts win even while the Web API answers", async () => {
-  const song = "0qMZXgcLfkl5RI3q50KHMH";
   const POPULAR = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
     0x84, 0xd3, 0xaa, 0xb8, 0x16, 0xad, 0x40, 0x67]);
   const store = new Map([["player", {
     accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
   }]]);
   const searched = [];
-  const { plugin } = await setup((call) => {
+  const { plugin, calls } = await setup((call) => {
     const path = call.url.pathname;
     if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3") return json({ id: "6PfSUFtkMVoDkx4MQkzOi3", name: "Artist" });
     if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3/albums") return json({ items: [{ id: "al", name: "Al" }], next: null });
     if (path === "/v1/me/library/contains") return json([false]);
     if (path === "/v1/search") { searched.push(call); return json({ tracks: { items: [], next: null } }); }
-    if (path === "/metadata/4/artist/e04de8ad658745069acb1691368654cf") {
-      return bytes(pbJoin([
-        pbString(2, "Artist"),
-        pbBytes(4, pbJoin([pbString(1, "JP"), pbBytes(2, pbJoin([pbBytes(1, POPULAR)]))])),
+    // The country route answers the chart, the artist's own answer the rest,
+    // and the rows' details come from the last of the three.
+    if (path.startsWith("/metadata/4/artist/")) {
+      return bytes(pbJoin([pbString(2, "Artist"), pbBytes(4, pbJoin([pbString(1, "JP"),
+        pbBytes(2, pbBytes(1, POPULAR))]))]));
+    }
+    if (extensionKindOf(call.body) === TRACK_V4) {
+      return bytes(metadataAnswer([entity(`spotify:track:${base62Of(POPULAR)}`, pbJoin([
+        pbString(2, "Chart Song"), pbSint(7, 100000)]))]));
+    }
+    if (extensionKindOf(call.body) === ARTIST_V4) {
+      return artistAnswer("6PfSUFtkMVoDkx4MQkzOi3", pbJoin([
+        pbString(2, "Artist"), pbBytes(17, pbBytes(1, pbJoin([pbBytes(1, COVER), pbInt(2, 3)]))),
+        // An album the session could read, were the Web API's albums missing.
+        pbBytes(5, pbBytes(1, pbBytes(1, ALBUM_GID))),
       ]));
     }
-    return bytes(metadataAnswer([entity(`spotify:track:${song}`, pbJoin([
-      pbString(2, "Chart Song"), pbSint(7, 100000),
-    ]))]));
+    return bytes(new TextEncoder().encode(JSON.stringify({ pages: [] })));
   }, { saved: signedIn(), store, settings: { clientId: "0123456789abcdef0123456789abcdef", market: "JP" } });
 
   const page = await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
   assert.deepEqual(page.tracks.map((t) => t.name), ["Chart Song"]);
-  assert.deepEqual(searched, []);
+  // The session's page carried the songs, so the Web API's search wasn't asked.
+  assert.equal(searched.length, 0);
   // The Web API still answered the albums, so the session didn't fetch them.
   assert.deepEqual(page.albums.map((a) => a.id), ["al"]);
+  assert.ok(!calls.some((call) => extensionKindOf(call.body) === ALBUM_V4));
+});
+
+// An artist's charts can name their songs by gid alone. The page then fills
+// them in with one batch, instead of the rows going missing.
+test("a chart list that only names its songs is read in one batch", async () => {
+  const GID_A = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
+    0x84, 0xd3, 0xaa, 0xb8, 0x16, 0xad, 0x40, 0x67]);
+  const GID_B = Uint8Array.from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+  const store = new Map([["player", {
+    accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
+  }]]);
+  const { plugin, calls } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3") return json({ id: "6PfSUFtkMVoDkx4MQkzOi3", name: "Artist" });
+    if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3/albums") return json({ items: [], next: null });
+    if (path === "/v1/me/library/contains") return json([false]);
+    if (path === "/v1/search") return json({ tracks: { items: [], next: null } });
+    if (extensionKindOf(call.body) === ARTIST_V4) {
+      return artistAnswer("6PfSUFtkMVoDkx4MQkzOi3", pbJoin([
+        pbString(2, "Artist"),
+        pbBytes(4, pbJoin([
+          pbString(1, "JP"),
+          pbBytes(2, pbBytes(1, GID_A)),
+          pbBytes(2, pbBytes(1, GID_B)),
+        ])),
+      ]));
+    }
+    return bytes(metadataAnswer([
+      entity(`spotify:track:${base62Of(GID_A)}`, pbJoin([pbString(2, "One"), pbSint(7, 1000)])),
+      entity(`spotify:track:${base62Of(GID_B)}`, pbJoin([pbString(2, "Two"), pbSint(7, 2000)])),
+    ]));
+  }, { saved: signedIn(), store, settings: { clientId: "0123456789abcdef0123456789abcdef", market: "JP" } });
+
+  const page = await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
+  assert.deepEqual(page.tracks.map((t) => t.name), ["One", "Two"]);
+  // The artist, then one batch for the songs it only named.
+  const metadata = calls.filter((call) => call.url.pathname === "/extended-metadata/v0/extended-metadata");
+  assert.equal(metadata.length, 2);
+  assert.equal(extensionKindOf(metadata[1].body), TRACK_V4);
+});
+
+// A chart is ten songs of an artist who has many more. The page leads with the
+// chart's order, then adds what search finds of the same artist, once each.
+test("the charts lead, and search adds the rest of the songs", async () => {
+  const POPULAR = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
+    0x84, 0xd3, 0xaa, 0xb8, 0x16, 0xad, 0x40, 0x67]);
+  const popular = base62Of(POPULAR);
+  const store = new Map([["player", {
+    accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
+  }]]);
+  const { plugin, calls } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3") return json({ id: "6PfSUFtkMVoDkx4MQkzOi3", name: "Artist" });
+    if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3/albums") return json({ items: [], next: null });
+    if (path === "/v1/me/library/contains") return json([false]);
+    if (path === "/v1/search") {
+      const mine = { artists: [{ id: "6PfSUFtkMVoDkx4MQkzOi3", name: "Artist" }] };
+      return json({
+        tracks: {
+          items: [
+            track(popular, { name: "Popular Song", ...mine }),
+            track("41QC4JsoYNy5LwW679i6Yx", { name: "Another Song", ...mine }),
+            track("5JaPBs2aQjEfLwM5kVb4jq", { name: "Someone Else", artists: [{ id: "another", name: "Another" }] }),
+          ],
+          next: null,
+        },
+      });
+    }
+    return artistAnswer("6PfSUFtkMVoDkx4MQkzOi3", pbJoin([
+      pbString(2, "Artist"),
+      pbBytes(4, pbJoin([pbString(1, "IN"), pbBytes(2, pbJoin([
+        pbBytes(1, POPULAR), pbString(2, "Popular Song")]))])),
+    ]));
+  }, { saved: signedIn(), store, settings: { clientId: "0123456789abcdef0123456789abcdef", market: "" } });
+
+  const page = await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
+  // The chart's song leads, the same song isn't listed twice, another artist's
+  // song isn't this artist's, and the rest of the songs follow.
+  assert.deepEqual(page.tracks.map((song) => song.name), ["Popular Song", "Another Song"]);
+  const search = calls.filter((call) => call.url.pathname === "/v1/search");
+  assert.equal(search.length, 1);
+  assert.equal(search[0].url.searchParams.get("q"), 'artist:"Artist"');
+});
+
+// The Web API's search is a narrow index: an artist's name there can miss
+// every song of theirs. The session's own search names them, and the page
+// adds the ones the charts leave out, once each, keeping only the artist's own.
+test("the session's search adds the songs the charts leave out", async () => {
+  const POPULAR = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
+    0x84, 0xd3, 0xaa, 0xb8, 0x16, 0xad, 0x40, 0x67]);
+  const BESIDE = Uint8Array.from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+  const store = new Map([["player", {
+    accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
+  }]]);
+  const ARTIST_GID = Uint8Array.from([0xe0, 0x4d, 0xe8, 0xad, 0x65, 0x87, 0x45, 0x06,
+    0x9a, 0xcb, 0x16, 0x91, 0x36, 0x86, 0x54, 0xcf]);
+  const track = (name, artistGid) => pbJoin([
+    pbString(2, name),
+    pbBytes(4, pbJoin([pbBytes(1, artistGid), pbString(2, "Artist")])),
+    pbSint(7, 1000),
+  ]);
+  const { plugin, calls } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3") return json({ id: "6PfSUFtkMVoDkx4MQkzOi3", name: "Artist" });
+    if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3/albums") return json({ items: [], next: null });
+    if (path === "/v1/me/library/contains") return json([false]);
+    if (path === "/context-resolve/v1/spotify:artist:6PfSUFtkMVoDkx4MQkzOi3") {
+      // The artist's own context: their charts, then their latest album's.
+      return bytes(new TextEncoder().encode(JSON.stringify({
+        pages: [
+          { tracks: [{ uri: `spotify:track:${base62Of(POPULAR)}` }] },
+          { tracks: [{ uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC" }] },
+        ],
+      })));
+    }
+    if (path.startsWith("/context-resolve/v1/spotify:search:")) {
+      // The same song the charts have, one of the artist's own, and one by
+      // somebody else, and another pressing of a song already listed.
+      return bytes(new TextEncoder().encode(JSON.stringify({
+        pages: [{
+          tracks: [
+            { uri: `spotify:track:${base62Of(POPULAR)}` },
+            { uri: `spotify:track:${base62Of(BESIDE)}` },
+            { uri: "spotify:track:5JaPBs2aQjEfLwM5kVb4jq" },
+            { uri: "spotify:track:0MMxQds9WTR9OSqrCCY7Mg" },
+          ],
+        }],
+      })));
+    }
+    if (extensionKindOf(call.body) === TRACK_V4) {
+      return bytes(metadataAnswer([
+        // The chart's own row, then the latest album's, then what search found.
+        entity(`spotify:track:${base62Of(POPULAR)}`, track("Popular Song", ARTIST_GID)),
+        entity("spotify:track:4uLU6hMCjMI75M1A2tKUQC", track("Album Song", ARTIST_GID)),
+        entity(`spotify:track:${base62Of(BESIDE)}`, track("Beside Song", ARTIST_GID)),
+        entity("spotify:track:5JaPBs2aQjEfLwM5kVb4jq", track("Someone Else", ALBUM_GID)),
+        entity("spotify:track:0MMxQds9WTR9OSqrCCY7Mg", track("Popular Song", ARTIST_GID)),
+      ]));
+    }
+    return artistAnswer("6PfSUFtkMVoDkx4MQkzOi3", pbJoin([
+      pbString(2, "Artist"),
+      pbBytes(4, pbJoin([pbString(1, "IN"), pbBytes(2, pbJoin([
+        pbBytes(1, POPULAR), pbString(2, "Popular Song")]))])),
+    ]));
+  }, { saved: signedIn(), store, settings: { clientId: "0123456789abcdef0123456789abcdef", market: "" } });
+
+  const page = await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
+  assert.deepEqual(page.tracks.map((song) => song.name), ["Popular Song", "Album Song", "Beside Song"]);
+  // The Web API's own search wasn't needed: the session's found the artist's
+  // songs, and the name was what it was asked for first.
+  const queries = calls
+    .filter((call) => call.url.pathname.startsWith("/context-resolve/v1/spotify:search:"))
+    .map((call) => decodeURIComponent(call.url.pathname.split("spotify:search:")[1]).replace(/\+/g, " "));
+  assert.deepEqual(queries, ["Artist", "Popular Song"]);
 });
 
 const quota = { error: { status: 429, message: "Too many requests", reason: "QUOTA_EXCEEDED" } };
