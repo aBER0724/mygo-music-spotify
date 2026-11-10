@@ -8,6 +8,8 @@
   "permissions": {
     "network": [
       "accounts.spotify.com",
+      "spclient.wg.spotify.com",
+      "i.scdn.co",
       "api.spotify.com",
       "lrclib.net",
       "music.163.com"

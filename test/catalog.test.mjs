@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  json, empty, signedIn, setup, track, me, fastPolling,
+  json, empty, bytes, signedIn, setup, track, me, fastPolling,
 } from "./helpers.mjs";
 
 // The host asks for the next page at the number already shown. Null items
@@ -213,4 +213,121 @@ test("a search still answers when it can't save its place", async () => {
   } finally {
     globalThis.host.storage.set = set;
   }
+});
+
+// --- the player identity -------------------------------------------------
+
+// Just enough protobuf to stand in for spclient's answers.
+const pbVarint = (value) => {
+  const bytes = [];
+  let left = value;
+  while (left > 0x7f) { bytes.push((left & 0x7f) | 0x80); left = Math.floor(left / 128); }
+  bytes.push(left);
+  return Uint8Array.from(bytes);
+};
+const pbJoin = (parts) => {
+  const bytes = new Uint8Array(parts.reduce((length, part) => length + part.length, 0));
+  let at = 0;
+  for (const part of parts) { bytes.set(part, at); at += part.length; }
+  return bytes;
+};
+const pbBytes = (number, value) => pbJoin([pbVarint(number * 8 + 2), pbVarint(value.length), value]);
+const pbString = (number, value) => pbBytes(number, new TextEncoder().encode(value));
+const pbInt = (number, value) => pbJoin([pbVarint(number * 8), pbVarint(value)]);
+const pbSint = (number, value) => pbInt(number, value >= 0 ? value * 2 : -value * 2 - 1);
+
+const ALBUM_GID = Uint8Array.from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+  0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+const ARTIST_GID = Uint8Array.from([0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+  0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10]);
+const COVER = Uint8Array.from([0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef]);
+
+const playlistRows = (uris, total = uris.length) => pbJoin([
+  pbInt(2, total),
+  pbBytes(5, pbJoin(uris.map((uri) => pbBytes(3, pbString(1, uri))))),
+]);
+
+const entity = (uri, message) => pbBytes(3, pbJoin([
+  pbString(2, uri),
+  pbBytes(3, pbJoin([pbString(1, "spotify:track"), pbBytes(2, message)])),
+]));
+const metadataAnswer = (entries) => pbJoin(entries.map((message) => pbBytes(2, message)));
+
+test("a playlist the Web API withholds is read from the player identity", async () => {
+  const first = "0qMZXgcLfkl5RI3q50KHMH";
+  const second = "41QC4JsoYNy5LwW679i6Yx";
+  const track = (name, duration) => pbJoin([
+    pbString(2, name),
+    pbBytes(3, pbJoin([
+      pbBytes(1, ALBUM_GID), pbString(2, "10,000 gecs"),
+      pbBytes(17, pbBytes(1, pbJoin([pbBytes(1, COVER), pbInt(2, 3)]))),
+    ])),
+    pbBytes(4, pbJoin([pbBytes(1, ARTIST_GID), pbString(2, "100 gecs")])),
+    pbSint(7, duration),
+  ]);
+  const store = new Map([["player", {
+    accessToken: "player-access", refreshToken: "player-refresh", expiresAt: Date.now() + 3600000,
+  }]]);
+  const { plugin, calls } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    if (call.url.pathname === "/v1/playlists/theirs") {
+      return json({ id: "theirs", name: "Theirs", owner: { id: "other" }, items: { total: 2 } });
+    }
+    if (call.url.pathname === "/playlist/v2/playlist/theirs") {
+      return bytes(playlistRows([`spotify:track:${first}`, "spotify:local:CHEMOTEX:Schrade+Knives:Schrade+Knives:353", `spotify:track:${second}`]));
+    }
+    if (call.url.pathname === "/extended-metadata/v0/extended-metadata") {
+      return bytes(metadataAnswer([
+        entity(`spotify:track:${first}`, track("Dumbest Girl Alive", 200000)),
+        entity(`spotify:track:${second}`, track("Residual Stress", 155000)),
+      ]));
+    }
+    throw new Error(`unexpected ${call.url.pathname}`);
+  }, { saved: signedIn(), store });
+
+  const theirs = await plugin.playlist({ id: "theirs" });
+  assert.equal(theirs.tracks.length, 3);
+  assert.equal(theirs.trackCount, 3);
+  assert.deepEqual(theirs.tracks.map((song) => song.id), [
+    first, `local:${encodeURIComponent("spotify:local:CHEMOTEX:Schrade+Knives:Schrade+Knives:353")}`, second,
+  ]);
+  assert.deepEqual(theirs.tracks.map((song) => song.name), ["Dumbest Girl Alive", "Schrade Knives", "Residual Stress"]);
+  // A local file counts in the playlist, as the Spotify app counts it.
+  assert.equal(theirs.tracks[1].unavailable, true);
+  assert.equal(theirs.tracks[1].duration, 353000);
+  assert.equal(theirs.tracks[0].duration, 200000);
+  assert.equal(theirs.tracks[0].url, `https://open.spotify.com/track/${first}`);
+  // A gid comes back as bytes: the app's album ID is the base62 of them.
+  assert.equal(theirs.tracks[0].album.id, "0296TIIbB3u904riPYGPJJ");
+  assert.equal(theirs.tracks[0].artists[0].id, "7KUVjxDTSChB9IHu38yRSo");
+  assert.equal(theirs.tracks[0].album.imageUrl, "https://i.scdn.co/image/deadbeefdeadbeefdeadbeef");
+  assert.equal(theirs.tracks[0].album.name, "10,000 gecs");
+
+  // The player's own token reads spclient; the app's Web API token doesn't.
+  const reads = calls.filter((call) => call.url.host === "spclient.wg.spotify.com");
+  // The rows, then one metadata request for the two songs that need details.
+  assert.equal(reads.length, 2);
+  assert.equal(reads[0].headers.Authorization, "Bearer player-access");
+  // Two songs cost one metadata request, not one each.
+  const metadata = reads.filter((call) => call.url.pathname === "/extended-metadata/v0/extended-metadata");
+  assert.equal(metadata.length, 1);
+  assert.equal(metadata[0].method, "POST");
+  assert.equal(metadata[0].headers["Content-Type"], "application/x-protobuf");
+});
+
+test("a listener who never approves the player identity keeps the note", async () => {
+  const { plugin } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    return json({ id: "theirs", name: "Theirs", owner: { id: "other" }, items: { total: 30 } });
+  }, {
+    saved: signedIn(),
+    // A closed page is a rejected approval, and nothing else is asked for.
+    redirect: async () => { throw new Error("sign-in timed out"); },
+  });
+  const theirs = await plugin.playlist({ id: "theirs" });
+  assert.deepEqual(theirs.tracks, []);
+  assert.match(theirs.description, /only your own and collaborative playlists/);
+  // The second playlist doesn't open a browser window again.
+  const again = await plugin.playlist({ id: "theirs" });
+  assert.deepEqual(again.tracks, []);
 });

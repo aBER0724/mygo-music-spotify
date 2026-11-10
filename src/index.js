@@ -660,6 +660,7 @@ export function signOut() {
   // The listener can remove the app's access at spotify.com/account/apps.
   clearSession();
   forgetLocal();
+  forgetPlayer();
   // A built-in player chosen for this account isn't chosen for the next one.
   host.storage.remove("device");
 }
@@ -863,6 +864,436 @@ export async function search({ query, kind = "tracks", offset = 0 }) {
   return { [kind]: results, more: !!page.next && items.length > 0 };
 }
 
+// --- Playlist songs as Spotify's own player reads them -------------------
+//
+// The Web API answers a Development Mode app with a playlist's cover, name
+// and length when the listener doesn't own it, and leaves the songs out. The
+// identity Spotify's own clients sign in with reads them anyway, so such a
+// playlist is read from spclient instead: its rows from /playlist/v2, and the
+// songs in those rows from /extended-metadata, five hundred at a time. That
+// identity is a second browser approval, so it is asked for when a playlist
+// first needs it, never at sign-in.
+
+const PLAYER = "player";
+const PLAYER_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd";
+const PLAYER_PORT = 8898; // the port Spotify's own player answers on
+const PLAYER_PATH = "/login";
+const PLAYER_REDIRECT = `http://127.0.0.1:${PLAYER_PORT}${PLAYER_PATH}`;
+const PLAYER_SCOPE = "streaming";
+const SPCLIENT = "https://spclient.wg.spotify.com";
+const ROWS_PAGE = 200; // spclient truncates a longer range of rows
+const METADATA_BATCH = 500; // songs per /extended-metadata request
+const SPCLIENT_PARALLEL = 4; // requests in flight at once
+const TRACK_TTL = 30 * 60 * 1000;
+const TRACK_CACHE_MAX = 4000;
+const ROWS_TTL = 5 * 60 * 1000;
+
+let player; // undefined until read; null when never approved
+let playerTokenRefresh = null;
+let playerPending = null;
+let playerRefused = false; // this run only: never open a second browser window
+const trackCache = new Map(); // track URI to { track, at }
+const rowsCache = new Map(); // playlist ID to { uris, total, at }
+
+function currentPlayer() {
+  if (player === undefined) player = host.storage.get(PLAYER) || null;
+  return player;
+}
+
+function persistPlayer() {
+  if (player) host.storage.set(PLAYER, player);
+  else host.storage.remove(PLAYER);
+}
+
+function forgetPlayer() {
+  player = null;
+  playerTokenRefresh = null;
+  playerPending = null;
+  rowsCache.clear();
+  trackCache.clear();
+  persistPlayer();
+}
+
+// One more browser approval, for the identity Spotify's own clients use. A
+// listener who closes the page keeps a plugin that works as it did before.
+async function playerSignIn() {
+  if (playerPending) {
+    host.signInPrompt({ text: t("Finish signing in to Spotify in your browser…") });
+    host.openURL(playerPending.url);
+    return playerPending.promise;
+  }
+  const verifier = randomString(64);
+  const state = randomString(24);
+  const url = `${ACCOUNTS}/authorize?${new URLSearchParams({
+    client_id: PLAYER_CLIENT_ID, response_type: "code", redirect_uri: PLAYER_REDIRECT,
+    code_challenge_method: "S256", code_challenge: codeChallenge(verifier),
+    state, scope: PLAYER_SCOPE,
+  })}`;
+  const entry = { url };
+  entry.promise = (async () => {
+    // Listen before the browser opens, so the redirect can't arrive first.
+    const redirect = host.waitForRedirect({
+      port: PLAYER_PORT, path: PLAYER_PATH, timeout: 180000,
+      page: t("Signed in to Spotify. You can close this page and go back to MyGo Music."),
+    });
+    host.signInPrompt({ text: t("Reading this playlist's songs needs one more Spotify approval. Close the page to skip.") });
+    host.openURL(url);
+    const query = await redirect;
+    if (query?.error || !query?.code || query.state !== state) {
+      throw fail("", t("That approval didn't come back from this request."));
+    }
+    const body = await tokenRequest({
+      grant_type: "authorization_code", code: query.code, redirect_uri: PLAYER_REDIRECT,
+      client_id: PLAYER_CLIENT_ID, code_verifier: verifier,
+    });
+    if (!body.refresh_token) throw fail("", t("Spotify didn't return a lasting approval."));
+    player = { accessToken: body.access_token, refreshToken: body.refresh_token,
+      expiresAt: Date.now() + Number(body.expires_in || 3600) * 1000 };
+    // The approval has to be for the account the app is signed in as: another
+    // one would answer with that account's playlists. Only its own account can
+    // read its rootlist, which is the one question this token can answer.
+    try {
+      const account = await profile();
+      await spclient("GET", `/playlist/v2/user/${account.id}/rootlist?from=0&length=0`);
+    } catch (error) {
+      player = null;
+      persistPlayer();
+      if (error?.status === 403) throw fail("", t("That approval was for a different Spotify account. Approve the one you're signed in as."));
+      throw error;
+    }
+    persistPlayer();
+    return player;
+  })();
+  playerPending = entry;
+  const done = () => { if (playerPending === entry) playerPending = null; };
+  entry.promise.then(done, done);
+  return entry.promise;
+}
+
+function playerToken() {
+  const active = currentPlayer();
+  if (!active) return playerSignIn().then((value) => value.accessToken);
+  if (active.accessToken && Date.now() < active.expiresAt - REFRESH_MARGIN) return Promise.resolve(active.accessToken);
+  if (playerTokenRefresh) return playerTokenRefresh;
+  const promise = (async () => {
+    const body = await tokenRequest({
+      grant_type: "refresh_token", refresh_token: active.refreshToken, client_id: PLAYER_CLIENT_ID,
+    });
+    acceptTokens(active, body);
+    persistPlayer();
+    return active.accessToken;
+  })();
+  const release = () => { if (playerTokenRefresh === promise) playerTokenRefresh = null; };
+  playerTokenRefresh = promise;
+  promise.then(release, release);
+  return promise;
+}
+
+// --- Protobuf, as much of it as these three answers need -----------------
+
+function pbVarint(value) {
+  const bytes = [];
+  let left = value;
+  while (left > 0x7f) {
+    bytes.push((left & 0x7f) | 0x80);
+    left = Math.floor(left / 128);
+  }
+  bytes.push(left);
+  return Uint8Array.from(bytes);
+}
+
+function pbJoin(parts) {
+  let length = 0;
+  for (const part of parts) length += part.length;
+  const bytes = new Uint8Array(length);
+  let at = 0;
+  for (const part of parts) {
+    bytes.set(part, at);
+    at += part.length;
+  }
+  return bytes;
+}
+
+const pbTag = (number, wire) => pbVarint(number * 8 + wire);
+const pbBytes = (number, value) => pbJoin([pbTag(number, 2), pbVarint(value.length), value]);
+const pbString = (number, value) => pbBytes(number, utf8Bytes(value));
+const pbInt = (number, value) => pbJoin([pbTag(number, 0), pbVarint(value)]);
+
+// pbRead answers the fields of one message: a number for a varint, the bytes
+// for anything longer. A length that runs past the answer is a refusal, not a
+// reason to read whatever follows.
+function pbRead(bytes) {
+  const fields = [];
+  let at = 0;
+  const readVarint = () => {
+    let value = 0;
+    let shift = 0;
+    for (;;) {
+      if (at >= bytes.length) throw fail("", t("Spotify sent something this plugin can't read."));
+      const byte = bytes[at++];
+      value += (byte & 0x7f) * 2 ** shift;
+      if (byte < 0x80) return value;
+      shift += 7;
+    }
+  };
+  while (at < bytes.length) {
+    const key = readVarint();
+    const number = Math.floor(key / 8);
+    const wire = key & 7;
+    if (wire === 0) fields.push({ n: number, value: readVarint() });
+    else if (wire === 2) {
+      const length = readVarint();
+      fields.push({ n: number, value: bytes.subarray(at, at + length) });
+      at += length;
+    } else if (wire === 5) at += 4;
+    else if (wire === 1) at += 8;
+    else throw fail("", t("Spotify sent something this plugin can't read."));
+  }
+  return fields;
+}
+
+const pbFirst = (fields, number) => fields.find((field) => field.n === number)?.value;
+const pbAll = (fields, number) => fields.filter((field) => field.n === number).map((field) => field.value);
+const decoder = new TextDecoder();
+const pbText = (value) => (value === undefined ? "" : decoder.decode(value));
+const pbSint = (value) => (value === undefined ? 0 : value % 2 ? -(value + 1) / 2 : value / 2);
+
+// Spotify writes an ID as 22 base62 digits of its 16 bytes, and hands a gid
+// back as those bytes.
+const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function base62(bytes) {
+  if (!bytes || !bytes.length) return "";
+  const digits = [];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let i = 0; i < digits.length; i++) {
+      carry += digits[i] * 256;
+      digits[i] = carry % 62;
+      carry = Math.floor(carry / 62);
+    }
+    while (carry) {
+      digits.push(carry % 62);
+      carry = Math.floor(carry / 62);
+    }
+  }
+  return digits.reverse().map((digit) => BASE62[digit]).join("").padStart(22, "0");
+}
+
+const hexOf = (bytes) => Array.from(bytes || [], (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+// --- spclient requests ---------------------------------------------------
+
+// Spotify paces spclient as it paces the Web API. A few reads run at once, so
+// a long playlist doesn't open a hundred connections, and a refused one waits
+// as long as Spotify asks before giving the page a reason.
+let spclientFree = SPCLIENT_PARALLEL;
+const spclientWaiting = [];
+
+async function spclientSlot(task) {
+  if (spclientFree) spclientFree--;
+  else await new Promise((resolve) => spclientWaiting.push(resolve));
+  try {
+    return await task();
+  } finally {
+    const next = spclientWaiting.shift();
+    if (next) next();
+    else spclientFree++;
+  }
+}
+
+async function spclient(method, path, body) {
+  return spclientSlot(async () => {
+    for (let attempt = 0; ; attempt++) {
+      const token = await playerToken();
+      const headers = { Authorization: `Bearer ${token}` };
+      const init = { method, headers };
+      if (body) {
+        headers["Content-Type"] = "application/x-protobuf";
+        init.body = body;
+      }
+      const response = await timedFetch(`${SPCLIENT}${path}`, init);
+      if (response.ok) return new Uint8Array(await response.arrayBuffer());
+      if (response.status === 401 && attempt === 0) {
+        // The token can be revoked before it expires: refresh once.
+        const active = currentPlayer();
+        if (active) active.expiresAt = 0;
+        continue;
+      }
+      if (method === "GET" && [502, 503, 504].includes(response.status) && attempt === 0) {
+        await sleep(1000);
+        continue;
+      }
+      if (response.status === 429 && attempt === 0) {
+        const wait = Number(response.headers.get("retry-after"));
+        if (Number.isFinite(wait) && wait >= 0 && wait <= 5) {
+          await sleep(Math.max(wait, 1) * 1000);
+          continue;
+        }
+      }
+      const refused = fail("unavailable", `${t("Spotify refused the request.")} (${response.status})`);
+      refused.status = response.status;
+      throw refused;
+    }
+  });
+}
+
+const rowsPath = (id, from) =>
+  `/playlist/v2/playlist/${id}?decorate=revision,length,attributes,owner&from=${from}&length=${ROWS_PAGE}`;
+
+// The songs of a playlist in order, however long it is. A page of rows is 200
+// at most, so a longer playlist is read a page at a time.
+async function readRows(id) {
+  const cached = rowsCache.get(id);
+  if (cached && Date.now() - cached.at < ROWS_TTL) return cached;
+  const page = async (from) => {
+    const fields = pbRead(await spclient("GET", rowsPath(id, from)));
+    const contents = pbFirst(fields, 5);
+    const rows = contents ? pbRead(contents) : [];
+    const all = pbAll(rows, 3).map((item) => pbText(pbFirst(pbRead(item), 1)));
+    return {
+      total: pbFirst(fields, 2) || 0,
+      truncated: pbFirst(rows, 2) === 1,
+      seen: all.length,
+      // Local files and episodes sit in playlists beside songs, and count in
+      // its length: every row is kept, so the page matches Spotify's count.
+      uris: all.filter(Boolean),
+    };
+  };
+  const head = await page(0);
+  const uris = [...head.uris];
+  let seen = head.seen;
+  let truncated = head.truncated;
+  while (truncated && seen < PLAYLIST_LIMIT) {
+    const next = await page(seen);
+    if (!next.seen) break;
+    uris.push(...next.uris);
+    seen += next.seen;
+    truncated = next.truncated;
+  }
+  const value = { uris, total: Math.max(head.total, seen), at: Date.now() };
+  rowsCache.set(id, value);
+  return value;
+}
+
+// --- Songs, five hundred to a request ------------------------------------
+
+// /extended-metadata takes a list of songs and answers their details in one
+// answer, so a thousand-song playlist costs two requests, not a thousand.
+function trackFrom(uri, fields) {
+  const id = uri.slice("spotify:track:".length);
+  const albumField = pbFirst(fields, 3);
+  const album = albumField ? pbRead(albumField) : [];
+  const artists = pbAll(fields, 4).map((artist) => {
+    const message = pbRead(artist);
+    return { id: base62(pbFirst(message, 1)), name: pbText(pbFirst(message, 2)), imageUrl: "" };
+  });
+  const name = pbText(pbFirst(fields, 2));
+  return {
+    id, name,
+    artists,
+    album: {
+      id: base62(pbFirst(album, 1)), name: pbText(pbFirst(album, 2)),
+      imageUrl: coverOf(album), artists: [], released: "",
+    },
+    duration: Math.max(0, pbSint(pbFirst(fields, 7))),
+    url: `https://open.spotify.com/track/${id}`,
+    unavailable: !name,
+  };
+}
+
+// A song's album pictures, from the largest of the group Spotify labels.
+function coverOf(album) {
+  const group = pbFirst(album, 17);
+  const images = group
+    ? pbAll(pbRead(group), 1).map((image) => pbRead(image))
+    : pbAll(album, 9).map((image) => pbRead(image));
+  const usable = images.filter((image) => pbFirst(image, 1)?.length);
+  if (!usable.length) return "";
+  const pick = usable.find((image) => pbFirst(image, 2) === 3) || usable[0];
+  return `https://i.scdn.co/image/${hexOf(pbFirst(pick, 1))}`;
+}
+
+// A local file has no metadata to ask for: its row spells out what it is.
+function localTrack(uri, index) {
+  const [artist = "", album = "", title = "", seconds = ""] = uri.split(":").slice(2);
+  const text = (value) => {
+    try { return decodeURIComponent(value).replace(/\+/g, " "); } catch { return value; }
+  };
+  return {
+    id: `local:${encodeURIComponent(uri)}`, name: text(title),
+    artists: artist ? [{ id: "", name: text(artist), imageUrl: "" }] : [],
+    album: { id: "", name: text(album), imageUrl: "", artists: [], released: "" },
+    duration: Math.max(0, Number(seconds) || 0) * 1000,
+    url: "", unavailable: true,
+  };
+}
+
+async function readTracks(uris) {
+  const wanted = uris.filter((uri) => uri.startsWith("spotify:track:"));
+  const stale = new Set(wanted.filter((uri) => {
+    const cached = trackCache.get(uri);
+    return !cached || Date.now() - cached.at >= TRACK_TTL;
+  }));
+  const batches = [];
+  const batch = wanted.filter((uri) => stale.has(uri));
+  for (let i = 0; i < batch.length; i += METADATA_BATCH) batches.push(batch.slice(i, i + METADATA_BATCH));
+  await Promise.all(batches.map(async (batch) => {
+    const request = pbJoin(batch.map((uri) => pbBytes(2, pbJoin([
+      pbString(1, uri),
+      pbBytes(2, pbInt(1, 10)), // TRACK_V4
+    ]))));
+    const fields = pbRead(await spclient("POST", "/extended-metadata/v0/extended-metadata", request));
+    for (const array of pbAll(fields, 2)) {
+      for (const entity of pbAll(pbRead(array), 3)) {
+        const data = pbRead(entity);
+        const uri = pbText(pbFirst(data, 2));
+        const any = pbFirst(data, 3);
+        const message = any ? pbFirst(pbRead(any), 2) : undefined;
+        if (!uri || !message) continue;
+        trackCache.set(uri, { track: trackFrom(uri, pbRead(message)), at: Date.now() });
+      }
+    }
+  }));
+  while (trackCache.size > TRACK_CACHE_MAX) trackCache.delete(trackCache.keys().next().value);
+  // A song Spotify keeps no details for still has its row, as the Web API's
+  // own page would show it: an empty row, not a silently shorter playlist.
+  let known = 0;
+  const tracks = uris.map((uri, index) => {
+    if (uri.startsWith("spotify:local:")) {
+      known++;
+      return localTrack(uri, index);
+    }
+    const track = trackCache.get(uri)?.track;
+    if (track) {
+      known++;
+      return track;
+    }
+    return missing("track", index);
+  });
+  return { tracks, known };
+}
+
+// The songs of a playlist the Web API withholds, or null when this listener
+// hasn't approved the player identity and won't be asked again this run.
+async function playerTracks(id) {
+  if (playerRefused && !currentPlayer()) return null;
+  try {
+    const rows = await readRows(id);
+    if (!rows.uris.length) return null;
+    const { tracks, known } = await readTracks(rows.uris);
+    if (!known) return null;
+    // Only a playlist longer than the app shows is worth saying so about.
+    return { tracks, total: rows.total, truncated: rows.total > rows.uris.length };
+  } catch (error) {
+    // The approval declined, timed out, or was refused: the page shows the
+    // note it showed before, and the browser stays closed from now on.
+    if (error?.code === "signIn") throw error;
+    playerRefused = true;
+    return null;
+  }
+}
+
 // --- Library ------------------------------------------------------------
 
 export async function playlists(max = 2000) {
@@ -878,8 +1309,17 @@ export async function playlist({ id }) {
   const result = toPlaylist(data, profileResult);
   const first = data.items ?? data.tracks;
   if (!first || !Array.isArray(first.items)) {
-    // Development Mode apps can read the songs of only the listener's own
-    // and collaborative playlists.
+    // Spotify withholds the songs of a playlist the listener doesn't own.
+    // The player identity reads them, so ask it before explaining the gap.
+    const read = await playerTracks(id);
+    if (read) {
+      result.tracks = read.tracks;
+      result.trackCount = Math.max(result.trackCount, read.total);
+      if (read.truncated) {
+        result.description += `${result.description ? "\n" : ""}${t("Showing the first 1000 songs.")}`;
+      }
+      return result;
+    }
     result.tracks = [];
     const note = t("Spotify lets this plugin list the songs of only your own and collaborative playlists. Open this one in the Spotify app to play it.");
     result.description = result.description ? `${result.description}\n${note}` : note;
