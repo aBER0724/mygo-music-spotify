@@ -29,6 +29,11 @@
       "link": "https://developer.spotify.com/dashboard"
     },
     {
+      "key": "market",
+      "label": "Chart country",
+      "help": "Optional. Two-letter country code, such as JP, US or HK, for the popular songs on an artist's page. Empty means US."
+    },
+    {
       "key": "soloistKey",
       "label": "Soloist API key",
       "help": "Optional. Lets the plugin play on this computer through Spotify Soloist, Spotify's own player, without the Spotify app open. Generate the key with your Premium account in Spotify for Developers. Then pair it once: after saving the key, open the Spotify app on your phone or this computer, on the same network, and choose \"MyGo Music on Mac\" (\"MyGo Music on Windows\" on Windows) in its list of devices.",

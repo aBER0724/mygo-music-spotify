@@ -1082,6 +1082,37 @@ function base62(bytes) {
 
 const hexOf = (bytes) => Array.from(bytes || [], (byte) => byte.toString(16).padStart(2, "0")).join("");
 
+// The country whose charts to read. Spotify's own clients take it from the
+// account, which the Web API no longer tells, so it is a setting here, and
+// US when it is empty or not a country code.
+const DEFAULT_MARKET = "US";
+function market() {
+  const value = String(host.setting("market") || "").trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(value) ? value : DEFAULT_MARKET;
+}
+
+// The 16 bytes behind an ID's 22 base62 digits: the request that asks for
+// metadata by gid spells them in hex.
+function gidOf(id) {
+  let digits = [...String(id)].map((character) => BASE62.indexOf(character));
+  if (!digits.length || digits.some((digit) => digit < 0)) return "";
+  const bytes = [];
+  while (digits.length) {
+    let rest = 0;
+    const next = [];
+    for (const digit of digits) {
+      rest = rest * 62 + digit;
+      const value = Math.floor(rest / 256);
+      rest %= 256;
+      if (next.length || value) next.push(value);
+    }
+    bytes.push(rest);
+    digits = next;
+  }
+  while (bytes.length < 16) bytes.push(0);
+  return bytes.reverse().map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 // --- spclient requests ---------------------------------------------------
 
 // Spotify paces spclient as it paces the Web API. A few reads run at once, so
@@ -1229,6 +1260,42 @@ function localTrack(uri, index) {
   };
 }
 
+// Albums, in one request the way songs are read: an artist's album groups
+// name nothing, only their gids.
+function albumFrom(uri, fields) {
+  const id = uri.slice("spotify:album:".length);
+  return {
+    id, name: pbText(pbFirst(fields, 2)), imageUrl: coverOf(fields),
+    artists: pbAll(fields, 3).map((artist) => {
+      const message = pbRead(artist);
+      return { id: base62(pbFirst(message, 1)), name: pbText(pbFirst(message, 2)), imageUrl: "" };
+    }),
+    released: "",
+  };
+}
+
+async function readAlbums(uris) {
+  const albums = [];
+  for (const batch of chunks(uris, METADATA_BATCH)) {
+    const request = pbJoin(batch.map((uri) => pbBytes(2, pbJoin([
+      pbString(1, uri),
+      pbBytes(2, pbInt(1, 9)), // ALBUM_V4
+    ]))));
+    const fields = pbRead(await spclient("POST", "/extended-metadata/v0/extended-metadata", request));
+    for (const array of pbAll(fields, 2)) {
+      for (const entity of pbAll(pbRead(array), 3)) {
+        const data = pbRead(entity);
+        const uri = pbText(pbFirst(data, 2));
+        const any = pbFirst(data, 3);
+        const message = any ? pbFirst(pbRead(any), 2) : undefined;
+        if (!uri || !message) continue;
+        albums.push(albumFrom(uri, pbRead(message)));
+      }
+    }
+  }
+  return albums.filter((album) => album.name);
+}
+
 async function readTracks(uris) {
   const wanted = uris.filter((uri) => uri.startsWith("spotify:track:"));
   const stale = new Set(wanted.filter((uri) => {
@@ -1292,6 +1359,54 @@ async function playerTracks(id) {
     playerRefused = true;
     return null;
   }
+}
+
+// A portrait, from the group of sizes Spotify keeps of it.
+function portraitOf(fields) {
+  const group = pbFirst(fields, 17);
+  const images = group ? pbAll(pbRead(group), 1).map((image) => pbRead(image)) : pbAll(fields, 11);
+  const usable = images.filter((image) => pbFirst(image, 1)?.length);
+  if (!usable.length) return "";
+  const pick = usable.find((image) => pbFirst(image, 2) === 3) || usable[0];
+  return `https://i.scdn.co/image/${hexOf(pbFirst(pick, 1))}`;
+}
+
+// The popular songs of one country, as the artist's metadata lists them. A
+// market Spotify lists no songs for falls back to the worldwide ranking, the
+// way Spotify's own table does.
+function chartUris(fields, country) {
+  const lists = pbAll(fields, 4).map((top) => pbRead(top));
+  const chosen = lists.find((top) => pbText(pbFirst(top, 1)) === country)
+    || lists.find((top) => pbText(pbFirst(top, 1)) === "ZZ")
+    || lists[0];
+  if (!chosen) return [];
+  return pbAll(chosen, 2)
+    .map((track) => base62(pbFirst(pbRead(track), 1)))
+    .filter(Boolean)
+    .map((gid) => `spotify:track:${gid}`);
+}
+
+// A whole artist page from Spotify's own metadata, which answers without the
+// Web API's quota: who they are, their portrait, their albums and singles, and
+// the popular songs of the country in the settings. Null when the listener
+// never approved the player identity: the page opens no browser window of its
+// own.
+async function playerArtist(id, needAlbums = true) {
+  const country = market();
+  if (!currentPlayer()) return null;
+  const fields = pbRead(await spclient("GET", `/metadata/4/artist/${gidOf(id)}?country=${country}`));
+  const name = pbText(pbFirst(fields, 2));
+  if (!name) return null;
+  const albumIds = [...pbAll(fields, 5), ...pbAll(fields, 6)]
+    .flatMap((group) => pbAll(pbRead(group), 1))
+    .map((album) => base62(pbFirst(pbRead(album), 1)))
+    .filter(Boolean);
+  const albums = needAlbums && albumIds.length
+    ? await readAlbums(albumIds.map((album) => `spotify:album:${album}`))
+    : [];
+  const uris = chartUris(fields, country);
+  const tracks = uris.length ? (await readTracks(uris)).tracks : [];
+  return { artist: { id, name, imageUrl: portraitOf(fields) }, tracks, albums };
 }
 
 // --- Library ------------------------------------------------------------
@@ -1470,6 +1585,19 @@ async function artistAlbums(id) {
   }
 }
 
+// An artist page is four reads over the Web API, two of them searches, and a
+// Development Mode app's quota is small. Spotify turning one of them down for
+// a moment shouldn't cost the listener the whole page, so a section it limits
+// stays empty and the page shows the rest.
+async function unlessLimited(task, fallback) {
+  try {
+    return await task();
+  } catch (error) {
+    if (error.status !== 429) throw error;
+    return fallback;
+  }
+}
+
 // Development Mode apps can't read an artist's top tracks, so the page lists
 // the artist's songs that search finds first, by Spotify's relevance.
 async function artistTracks(artistResult) {
@@ -1488,12 +1616,29 @@ async function artistTracks(artistResult) {
 
 export async function artist({ id }) {
   id = idOf(id);
+  let limited = null;
   const [data, albums, following] = await Promise.all([
-    api("GET", `/artists/${id}`), artistAlbums(id), savedFlag(`spotify:artist:${id}`),
+    api("GET", `/artists/${id}`).catch((error) => {
+      // A Development Mode app's quota runs out as a 429, and the session can
+      // still answer the page, so it is kept for the fallback below.
+      if (error?.status !== 429) throw error;
+      limited = error;
+      return null;
+    }),
+    unlessLimited(() => artistAlbums(id), []),
+    savedFlag(`spotify:artist:${id}`),
   ]);
-  if (!data) throw fail("unavailable", t("This artist isn't available."));
-  const result = { ...toArtist(data), following };
-  return { artist: result, tracks: await artistTracks(result), albums: albums.filter(Boolean).map(toAlbum) };
+  // With the player identity, the session's charts are what the page is for,
+  // and its albums stand in for any the Web API had no quota left to answer. It
+  // is the whole page when the Web API answered nothing at all.
+  const played = currentPlayer()
+    ? await playerArtist(id, !albums.length).catch(() => null)
+    : null;
+  if (!data && !played) throw limited || fail("unavailable", t("This artist isn't available."));
+  const result = data ? { ...toArtist(data), following } : { ...played.artist, following: false };
+  const tracks = played?.tracks?.length ? played.tracks : await unlessLimited(() => artistTracks(result), []);
+  const albumList = albums.length ? albums.filter(Boolean).map(toAlbum) : played?.albums || [];
+  return { artist: result, tracks, albums: albumList };
 }
 
 export async function followArtist({ id, on }) {
