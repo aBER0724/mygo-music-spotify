@@ -98,5 +98,7 @@
   "It comes back on its own.": "过一会儿会自己恢复。",
   "It comes back in about {hours} h.": "大约 {hours} 小时后恢复。",
   "It comes back in about {minutes} min.": "大约 {minutes} 分钟后恢复。",
-  "Each app in the Spotify Developer Dashboard has a quota of its own.": "开发者面板里的每个应用各自有一份配额。"
+  "Each app in the Spotify Developer Dashboard has a quota of its own.": "开发者面板里的每个应用各自有一份配额。",
+  "Spotify withdrew the extra approval. The next page that needs it asks again.": "Spotify 收回了那次额外授权。下一个需要它的页面会重新请求。",
+  "The popular songs on an artist's page need one more Spotify approval. Close the page to skip.": "歌手页的热门歌曲需要再授权一次 Spotify。关闭页面即可跳过。"
 }

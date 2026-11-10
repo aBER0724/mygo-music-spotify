@@ -420,6 +420,80 @@ test("with no chart country set, an artist page reads the US chart", async () =>
   assert.equal(artist.url.searchParams.get("country"), "US");
 });
 
+// Spotify can revoke the player approval. The artist page then asks for a
+// new one, instead of falling back to search on every page from then on.
+test("a revoked player approval is asked for again by the artist page", async () => {
+  const popular = "0qMZXgcLfkl5RI3q50KHMH";
+  const POPULAR_GID = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,
+    0x84, 0xd3, 0xaa, 0xb8, 0x16, 0xad, 0x40, 0x67]);
+  // An access token past its time, and a refresh token Spotify revoked.
+  const store = new Map([["player", {
+    accessToken: "old-access", refreshToken: "revoked", expiresAt: Date.now() - 1000,
+  }]]);
+  const prompts = [];
+  const { plugin, calls, opened } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/api/token") {
+      const form = new URLSearchParams(call.body);
+      if (form.get("grant_type") === "refresh_token") {
+        return json({ error: "invalid_grant", error_description: "Refresh token revoked" }, 400);
+      }
+      return json({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 3600 });
+    }
+    if (path === "/v1/me") return json(me);
+    if (path.startsWith("/playlist/v2/user/")) return bytes(new Uint8Array());
+    if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3") return json({ id: "6PfSUFtkMVoDkx4MQkzOi3", name: "Artist" });
+    if (path === "/v1/artists/6PfSUFtkMVoDkx4MQkzOi3/albums") return json({ items: [], next: null });
+    if (path === "/v1/me/library/contains") return json([false]);
+    if (path === "/metadata/4/artist/e04de8ad658745069acb1691368654cf") {
+      return bytes(pbJoin([pbString(2, "Artist"),
+        pbBytes(4, pbJoin([pbString(1, "JP"), pbBytes(2, pbJoin([pbBytes(1, POPULAR_GID)]))]))]));
+    }
+    if (path === "/extended-metadata/v0/extended-metadata") {
+      return bytes(metadataAnswer([entity(`spotify:track:${popular}`, pbJoin([pbString(2, "Popular Song"), pbSint(7, 1000)]))]));
+    }
+    throw new Error(`unexpected ${path}`);
+  }, {
+    saved: signedIn(), store, settings: { clientId: "0123456789abcdef0123456789abcdef", market: "JP" },
+    // The plugin listens before it opens the browser: answer once it has.
+    redirect: async (_options, urls) => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return { code: "code", state: new URL(urls.at(-1)).searchParams.get("state") };
+    },
+  });
+  globalThis.host.signInPrompt = (prompt) => prompts.push(prompt.text);
+
+  const page = await plugin.artist({ id: "6PfSUFtkMVoDkx4MQkzOi3" });
+  assert.deepEqual(page.tracks.map((song) => song.id), [popular]);
+  // One browser window, saying what it is for.
+  assert.equal(opened.length, 1);
+  assert.match(prompts[0], /popular songs on an artist's page/);
+  assert.equal(store.get("player").refreshToken, "new-refresh");
+  const artist = calls.find((call) => call.url.pathname.startsWith("/metadata/4/artist/"));
+  assert.equal(artist.headers.Authorization, "Bearer new-access");
+});
+
+test("an artist page turned down for the approval falls back to search once", async () => {
+  let asked = 0;
+  const { plugin, opened } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/artists/ar1") return json({ id: "ar1", name: "Artist" });
+    if (path === "/v1/artists/ar1/albums") return json({ items: [], next: null });
+    if (path === "/v1/me/library/contains") return json([false]);
+    if (path === "/v1/search") return json({ tracks: { items: [track("s1", { artists: [{ id: "ar1", name: "Artist" }] })], next: null } });
+    throw new Error(`unexpected ${path}`);
+  }, {
+    saved: signedIn(), settings: { clientId: "0123456789abcdef0123456789abcdef", market: "JP" },
+    redirect: async () => { asked++; throw new Error("sign-in timed out"); },
+  });
+  const page = await plugin.artist({ id: "ar1" });
+  assert.deepEqual(page.tracks.map((t) => t.id), ["s1"]);
+  // The next artist page doesn't open a browser window again.
+  await plugin.artist({ id: "ar1" });
+  assert.equal(asked, 1);
+  assert.equal(opened.length, 1);
+});
+
 test("an artist page comes from the session when the quota is spent", async () => {
   const song = "0qMZXgcLfkl5RI3q50KHMH";
   const POPULAR = Uint8Array.from([0x0e, 0x32, 0x8f, 0xc4, 0x26, 0xfa, 0x46, 0x43,

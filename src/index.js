@@ -967,7 +967,8 @@ function forgetPlayer() {
 
 // One more browser approval, for the identity Spotify's own clients use. A
 // listener who closes the page keeps a plugin that works as it did before.
-async function playerSignIn() {
+// prompt says what the approval is for.
+async function playerSignIn(prompt) {
   if (playerPending) {
     host.signInPrompt({ text: t("Finish signing in to Spotify in your browser…") });
     host.openURL(playerPending.url);
@@ -987,7 +988,7 @@ async function playerSignIn() {
       port: PLAYER_PORT, path: PLAYER_PATH, timeout: 180000,
       page: t("Signed in to Spotify. You can close this page and go back to MyGo Music."),
     });
-    host.signInPrompt({ text: t("Reading this playlist's songs needs one more Spotify approval. Close the page to skip.") });
+    host.signInPrompt({ text: prompt || t("Reading this playlist's songs needs one more Spotify approval. Close the page to skip.") });
     host.openURL(url);
     const query = await redirect;
     if (query?.error || !query?.code || query.state !== state) {
@@ -1021,18 +1022,30 @@ async function playerSignIn() {
   return entry.promise;
 }
 
-function playerToken() {
+function playerToken(prompt) {
   const active = currentPlayer();
-  if (!active) return playerSignIn().then((value) => value.accessToken);
+  if (!active) return playerSignIn(prompt).then((value) => value.accessToken);
   if (active.accessToken && Date.now() < active.expiresAt - REFRESH_MARGIN) return Promise.resolve(active.accessToken);
   if (playerTokenRefresh) return playerTokenRefresh;
   const promise = (async () => {
-    const body = await tokenRequest({
-      grant_type: "refresh_token", refresh_token: active.refreshToken, client_id: PLAYER_CLIENT_ID,
-    });
-    acceptTokens(active, body);
-    persistPlayer();
-    return active.accessToken;
+    try {
+      const body = await tokenRequest({
+        grant_type: "refresh_token", refresh_token: active.refreshToken, client_id: PLAYER_CLIENT_ID,
+      });
+      acceptTokens(active, body);
+      persistPlayer();
+      return active.accessToken;
+    } catch (error) {
+      // Spotify revoked the approval. Keeping it would fail the same way on
+      // every page and never ask again: forget it, so the next page that
+      // needs it asks for a new one.
+      // It isn't the app's own sign-in that ended, so it mustn't read as one.
+      if (error?.code === "signIn") {
+        if (player === active) forgetPlayer();
+        throw fail("playerRevoked", t("Spotify withdrew the extra approval. The next page that needs it asks again."));
+      }
+      throw error;
+    }
   })();
   const release = () => { if (playerTokenRefresh === promise) playerTokenRefresh = null; };
   playerTokenRefresh = promise;
@@ -1184,10 +1197,11 @@ async function spclientSlot(task) {
   }
 }
 
-async function spclient(method, path, body) {
+// prompt says what an approval asked for here is for.
+async function spclient(method, path, body, prompt) {
   return spclientSlot(async () => {
     for (let attempt = 0; ; attempt++) {
-      const token = await playerToken();
+      const token = await playerToken(prompt);
       const headers = { Authorization: `Bearer ${token}` };
       const init = { method, headers };
       if (body) {
@@ -1394,7 +1408,7 @@ async function readTracks(uris) {
 
 // The songs of a playlist the Web API withholds, or null when this listener
 // hasn't approved the player identity and won't be asked again this run.
-async function playerTracks(id) {
+async function playerTracks(id, retried = false) {
   if (playerRefused && !currentPlayer()) return null;
   try {
     const rows = await readRows(id);
@@ -1404,6 +1418,8 @@ async function playerTracks(id) {
     // Only a playlist longer than the app shows is worth saying so about.
     return { tracks, total: rows.total, truncated: rows.total > rows.uris.length };
   } catch (error) {
+    // Spotify withdrew an approval it had given: ask once for a new one.
+    if (error?.code === "playerRevoked" && !retried) return playerTracks(id, true);
     // The approval declined, timed out, or was refused: the page shows the
     // note it showed before, and the browser stays closed from now on.
     if (error?.code === "signIn") throw error;
@@ -1440,12 +1456,21 @@ function chartUris(fields, country) {
 // A whole artist page from Spotify's own metadata, which answers without the
 // Web API's quota: who they are, their portrait, their albums and singles, and
 // the popular songs of the country in the settings. Null when the listener
-// never approved the player identity: the page opens no browser window of its
-// own.
-async function playerArtist(id, needAlbums = true) {
+// has turned the approval down this run. A page without the approval asks for
+// it once, and asks again when Spotify withdraws one it gave.
+async function playerArtist(id, needAlbums = true, retried = false) {
   const country = market();
-  if (!currentPlayer()) return null;
-  const fields = pbRead(await spclient("GET", `/metadata/4/artist/${gidOf(id)}?country=${country}`));
+  if (playerRefused && !currentPlayer()) return null;
+  let fields;
+  try {
+    fields = pbRead(await spclient("GET", `/metadata/4/artist/${gidOf(id)}?country=${country}`,
+      undefined, t("The popular songs on an artist's page need one more Spotify approval. Close the page to skip.")));
+  } catch (error) {
+    if (error?.code === "playerRevoked" && !retried) return playerArtist(id, needAlbums, true);
+    // The approval declined or timed out: no browser window again this run.
+    if (!currentPlayer()) playerRefused = true;
+    throw error;
+  }
   const name = pbText(pbFirst(fields, 2));
   if (!name) return null;
   const albumIds = [...pbAll(fields, 5), ...pbAll(fields, 6)]
@@ -1693,12 +1718,11 @@ export async function artist({ id }) {
     unlessLimited(() => artistAlbums(id), [], (error) => { albumsSpent = error; }),
     savedFlag(`spotify:artist:${id}`),
   ]);
-  // With the player identity, the session's charts are what the page is for,
-  // and its albums stand in for any the Web API had no quota left to answer. It
-  // is the whole page when the Web API answered nothing at all.
-  const played = currentPlayer()
-    ? await playerArtist(id, !albums.length).catch(() => null)
-    : null;
+  // The session's charts are what the page is for, and its albums stand in
+  // for any the Web API had no quota left to answer. It is the whole page when
+  // the Web API answered nothing at all. Without the approval it needs,
+  // playerArtist asks for it once; turned down, the page falls back to search.
+  const played = await playerArtist(id, !albums.length).catch(() => null);
   if (!data && !played) throw limited || fail("unavailable", t("This artist isn't available."));
   const result = data ? { ...toArtist(data), following } : { ...played.artist, following: false };
   const tracks = played?.tracks?.length
