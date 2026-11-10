@@ -497,3 +497,102 @@ test("with a country set, the charts win even while the Web API answers", async 
   // The Web API still answered the albums, so the session didn't fetch them.
   assert.deepEqual(page.albums.map((a) => a.id), ["al"]);
 });
+
+const quota = { error: { status: 429, message: "Too many requests", reason: "QUOTA_EXCEEDED" } };
+// Spotify says how long a spent quota lasts: here, 35077 s, about 10 h.
+const spent = () => json(quota, 429, { "retry-after": "35077" });
+
+test("a spent quota is named, with how long it lasts", async () => {
+  let calls = 0;
+  const { plugin } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/me") return json(me);
+    if (path === "/v1/playlists/p1") {
+      return json({ id: "p1", name: "L", owner: { id: "listener" },
+        items: { total: 2, items: [{ item: track("a") }], next: "https://api.spotify.com/v1/playlists/p1/items?offset=1" } });
+    }
+    calls++;
+    return spent();
+  }, { saved: signedIn() });
+
+  // The playlist still loads, with the reason in its description.
+  const list = await plugin.playlist({ id: "p1" });
+  assert.equal(list.tracks.length, 1);
+  assert.match(list.description, /quota for your app is spent\. Part of this page is missing\. It comes back in about 10 h\./);
+  // A quota hours away isn't waited out.
+  assert.equal(calls, 1);
+});
+
+test("an artist page the quota emptied says so in a grey row", async () => {
+  const { plugin } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/artists/ar1") return json({ id: "ar1", name: "Artist" });
+    if (path === "/v1/me/library/contains") return json([false]);
+    return spent();
+  }, { saved: signedIn() });
+  const page = await plugin.artist({ id: "ar1" });
+  assert.equal(page.artist.name, "Artist");
+  assert.deepEqual(page.albums, []);
+  assert.equal(page.tracks.length, 1);
+  const [row] = page.tracks;
+  assert.equal(row.unavailable, true);
+  assert.match(row.id, /^missing:/);
+  assert.match(row.name, /quota for your app is spent/);
+  assert.match(row.artists[0].name, /about 10 h/);
+  // The row can't be played or saved.
+  await assert.rejects(plugin.remotePlay({ ids: [row.id] }), /can't play this song/);
+});
+
+test("an artist page names the quota when only its albums are missing", async () => {
+  const { plugin } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/artists/ar1") return json({ id: "ar1", name: "Artist" });
+    if (path === "/v1/me/library/contains") return json([false]);
+    if (path === "/v1/search") return json({ tracks: { items: [track("s1", { artists: [{ id: "ar1", name: "Artist" }] })], next: null } });
+    return spent();
+  }, { saved: signedIn() });
+  const page = await plugin.artist({ id: "ar1" });
+  assert.deepEqual(page.tracks.map((t) => t.id), ["missing:quota", "s1"]);
+});
+
+test("an artist page the quota didn't touch has no note", async () => {
+  const { plugin } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/artists/ar1") return json({ id: "ar1", name: "Artist" });
+    if (path === "/v1/artists/ar1/albums") return json({ items: [{ id: "al", name: "Al" }], next: null });
+    if (path === "/v1/me/library/contains") return json([false]);
+    if (path === "/v1/search") return json({ tracks: { items: [track("s1", { artists: [{ id: "ar1", name: "Artist" }] })], next: null } });
+    // Another page spent its quota earlier: this one is unaffected.
+    return spent();
+  }, { saved: signedIn() });
+  await plugin.browse({ page: "top" });
+  const page = await plugin.artist({ id: "ar1" });
+  assert.deepEqual(page.tracks.map((t) => t.id), ["s1"]);
+});
+
+test("the pages that can say the quota is spent, say so", async () => {
+  const { plugin } = await setup(() => spent(), { saved: signedIn() });
+  // Home is headed by the app itself, which shows no description of ours, so
+  // the note lives on the pages the plugin makes: here, Top tracks.
+  const top = await plugin.browse({ page: "top" });
+  assert.match(top.description, /quota for your app is spent/);
+  assert.equal(top.sections.length, 3);
+  const recent = await plugin.browse({ page: "recent" });
+  assert.match(recent.description, /about 10 h/);
+  // Home says it in each section the quota emptied.
+  const home = await plugin.home();
+  for (const section of home.sections) assert.match(section.empty, /quota for your app is spent/);
+});
+
+test("a page Spotify answered says nothing of a quota spent elsewhere", async () => {
+  const { plugin } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/artists/ar1/albums") return spent();
+    if (path === "/v1/artists/ar1") return json({ id: "ar1", name: "Artist" });
+    if (path.startsWith("/v1/me/top/")) return json({ items: [] });
+    return json({ items: [], next: null });
+  }, { saved: signedIn() });
+  await plugin.artist({ id: "ar1" });
+  const top = await plugin.browse({ page: "top" });
+  assert.equal(top.description, undefined);
+});

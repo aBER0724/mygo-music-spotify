@@ -92,5 +92,11 @@
   "That approval was for a different Spotify account. Approve the one you're signed in as.": "这次授权用的是另一个 Spotify 账号。请授权你当前登录的账号。",
   "Showing the first 1000 songs.": "只显示前 1000 首。",
   "Chart country": "榜单国家",
-  "Optional. Two-letter country code, such as JP, US or HK, for the popular songs on an artist's page. Empty means US.": "可选。两位国家代码，例如 JP、US、HK，用于歌手页的热门歌曲。不填则按 US。"
+  "Optional. Two-letter country code, such as JP, US or HK, for the popular songs on an artist's page. Empty means US.": "可选。两位国家代码，例如 JP、US、HK，用于歌手页的热门歌曲。不填则按 US。",
+  "Spotify's quota for your app is spent.": "Spotify 给你的应用分配的配额用完了。",
+  "Part of this page is missing.": "这一页有部分内容没加载出来。",
+  "It comes back on its own.": "过一会儿会自己恢复。",
+  "It comes back in about {hours} h.": "大约 {hours} 小时后恢复。",
+  "It comes back in about {minutes} min.": "大约 {minutes} 分钟后恢复。",
+  "Each app in the Spotify Developer Dashboard has a quota of its own.": "开发者面板里的每个应用各自有一份配额。"
 }

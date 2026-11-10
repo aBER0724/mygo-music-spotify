@@ -49,6 +49,33 @@ let searchCursors; // undefined until read: shown counts to Spotify's offsets
 
 const t = (text) => host.t(text);
 
+// A Development Mode app's quota is small, and Spotify keeps one per endpoint:
+// when it is spent, one kind of read is refused for hours while the rest still
+// answer. So a page names it only when one of its own reads met it, with the
+// wait Spotify gave in Retry-After, rather than the passing refusal any request
+// here can get.
+const isQuota = (error) => error?.code === "quota";
+function quotaBack(error) {
+  const seconds = Number(error?.retryAfter);
+  if (!Number.isFinite(seconds) || seconds <= 0) return t("It comes back on its own.");
+  if (seconds >= 3600) return t("It comes back in about {hours} h.").replace("{hours}", String(Math.ceil(seconds / 3600)));
+  return t("It comes back in about {minutes} min.").replace("{minutes}", String(Math.max(1, Math.ceil(seconds / 60))));
+}
+const quotaHead = () => t("Spotify's quota for your app is spent.");
+// What a page that loaded without some of its parts says about them.
+const quotaText = (error) => `${quotaHead()} ${t("Part of this page is missing.")} ${quotaBack(error)} ${t("Each app in the Spotify Developer Dashboard has a quota of its own.")}`;
+// What a page that couldn't load at all says.
+const quotaError = (error) => `${quotaHead()} ${quotaBack(error)} ${t("Each app in the Spotify Developer Dashboard has a quota of its own.")}`;
+// A page with no description of its own says it in a grey row at the top of
+// its songs, one the app can't play.
+const QUOTA_ROW = "missing:quota";
+const quotaRow = (error) => ({
+  id: QUOTA_ROW, name: quotaHead(),
+  artists: [{ id: "", name: `${t("Part of this page is missing.")} ${quotaBack(error)}` }],
+  album: { id: "", name: "" }, duration: 0, unavailable: true,
+});
+const firstQuota = (results) => results.map((result) => result?.error ?? result).find(isQuota) || null;
+
 function fail(code, message) {
   const error = new Error(message);
   if (code) error.code = code;
@@ -291,7 +318,7 @@ function accessToken(active) {
   return refresh(active);
 }
 
-function apiError(status, body) {
+function apiError(status, body, retryAfter) {
   const detail = body?.error || {};
   const reason = detail.reason || "";
   const message = typeof detail.message === "string" ? detail.message : "";
@@ -300,6 +327,10 @@ function apiError(status, body) {
     error = fail("unavailable", t("Controlling playback needs Spotify Premium."));
   } else if (status === 403 && /not registered|not been registered|user may not be registered/i.test(message)) {
     error = fail("setup", t("This Spotify account isn't allowed to use your app. Add it under User Management in the Spotify Developer Dashboard."));
+  } else if (status === 429 && /QUOTA_EXCEEDED/i.test(reason)) {
+    error = fail("quota", "");
+    error.retryAfter = retryAfter;
+    error.message = quotaError(error);
   } else if (status === 429) {
     error = fail("", t("Spotify is limiting requests. Wait a moment and try again."));
   } else if (status === 404) {
@@ -356,7 +387,8 @@ async function api(method, path, { query, body, attempt = 0, deadline } = {}) {
     if (generation !== epoch) throw changed();
     return api(method, path, { query, body, attempt: 1, deadline });
   }
-  if (response.status === 429 && attempt === 0) {
+  // A spent quota is hours away, whatever Retry-After says: no use waiting.
+  if (response.status === 429 && attempt === 0 && !/QUOTA_EXCEEDED/i.test(data?.error?.reason || "")) {
     const wait = Number(response.headers.get("retry-after"));
     if (Number.isFinite(wait) && wait >= 0 && wait <= 5) {
       await sleep(Math.max(wait, 1) * 1000);
@@ -364,7 +396,7 @@ async function api(method, path, { query, body, attempt = 0, deadline } = {}) {
       return api(method, path, { query, body, attempt: 1, deadline });
     }
   }
-  throw apiError(response.status, data);
+  throw apiError(response.status, data, Number(response.headers.get("retry-after")));
 }
 
 // more follows the `next` links of a page Spotify gave, adding their items
@@ -748,16 +780,32 @@ export async function home() {
   };
 }
 
+// The pages this plugin makes up show their description under the title, so
+// that is where a spent quota is said, when one of the page's own reads met
+// it. Home has no such line of its own (the app heads it instead): there a
+// section the quota emptied says so in its empty text.
+const quotaLine = (results) => {
+  const error = firstQuota(results);
+  return error ? { description: quotaText(error) } : {};
+};
+
 export async function browse({ page }) {
   if (page === "recent") {
-    return { title: t("Recently played"), sections: [{ tracks: await recentTracks(), empty: t("Play something in Spotify and it shows here.") }] };
+    const [recentResult] = await settled([recentTracks()]);
+    return {
+      title: t("Recently played"), ...quotaLine([recentResult]),
+      sections: [{
+        tracks: recentResult.value || [],
+        empty: emptyOr(recentResult, t("Play something in Spotify and it shows here.")),
+      }],
+    };
   }
   if (page === "top") {
     const [month, halfYear, artists] = await settled([
       topTracks("short_term", 50), topTracks("medium_term", 50), topArtists("medium_term", 50),
     ]);
     return {
-      title: t("Top tracks"),
+      title: t("Top tracks"), ...quotaLine([month, halfYear, artists]),
       sections: [
         { title: t("Last 4 weeks"), tracks: month.value || [], empty: emptyOr(month, t("Not enough listening yet.")) },
         { title: t("Last 6 months"), tracks: halfYear.value || [], empty: emptyOr(halfYear, t("Not enough listening yet.")) },
@@ -766,11 +814,14 @@ export async function browse({ page }) {
     };
   }
   if (page === "me") {
-    const profileResult = await profile();
-    const lists = await playlists();
+    const [profileResult, listsResult] = await settled([profile(), playlists()]);
+    const lists = listsResult.value || [];
     return {
-      title: profileResult.name, imageUrl: profileResult.imageUrl,
-      sections: [{ title: t("Your playlists"), playlists: lists.filter((item) => item.mine), empty: t("You have no playlists yet.") }],
+      title: profileResult.value?.name || "", imageUrl: profileResult.value?.imageUrl, ...quotaLine([profileResult, listsResult]),
+      sections: [{
+        title: t("Your playlists"), playlists: lists.filter((item) => item.mine),
+        empty: emptyOr(listsResult, t("You have no playlists yet.")),
+      }],
     };
   }
   throw fail("unsupported", t("There's no such page."));
@@ -1440,7 +1491,17 @@ export async function playlist({ id }) {
     result.description = result.description ? `${result.description}\n${note}` : note;
     return result;
   }
-  const entries = await more([...first.items], first, PLAYLIST_LIMIT);
+  // A page Spotify can't finish is still worth what it has, with the reason
+  // in its description rather than an empty page and a Retry.
+  let entries = [...first.items];
+  let spent = null;
+  try {
+    entries = await more(entries, first, PLAYLIST_LIMIT);
+  } catch (error) {
+    if (!isQuota(error)) throw error;
+    spent = error;
+  }
+  if (spent) result.description += `${result.description ? "\n" : ""}${quotaText(spent)}`;
   result.tracks = entries.map((entry, index) => toTrack(entry?.item ?? entry?.track, undefined, index));
   if (result.trackCount > PLAYLIST_LIMIT) {
     result.description += `${result.description ? "\n" : ""}${t("Showing the first 1000 songs.")}`;
@@ -1588,12 +1649,14 @@ async function artistAlbums(id) {
 // An artist page is four reads over the Web API, two of them searches, and a
 // Development Mode app's quota is small. Spotify turning one of them down for
 // a moment shouldn't cost the listener the whole page, so a section it limits
-// stays empty and the page shows the rest.
-async function unlessLimited(task, fallback) {
+// stays empty and the page shows the rest. A spent quota is handed to noted,
+// so the page can say why the section is empty.
+async function unlessLimited(task, fallback, noted) {
   try {
     return await task();
   } catch (error) {
     if (error.status !== 429) throw error;
+    if (isQuota(error)) noted?.(error);
     return fallback;
   }
 }
@@ -1617,6 +1680,8 @@ async function artistTracks(artistResult) {
 export async function artist({ id }) {
   id = idOf(id);
   let limited = null;
+  let albumsSpent = null;
+  let tracksSpent = null;
   const [data, albums, following] = await Promise.all([
     api("GET", `/artists/${id}`).catch((error) => {
       // A Development Mode app's quota runs out as a 429, and the session can
@@ -1625,7 +1690,7 @@ export async function artist({ id }) {
       limited = error;
       return null;
     }),
-    unlessLimited(() => artistAlbums(id), []),
+    unlessLimited(() => artistAlbums(id), [], (error) => { albumsSpent = error; }),
     savedFlag(`spotify:artist:${id}`),
   ]);
   // With the player identity, the session's charts are what the page is for,
@@ -1636,9 +1701,16 @@ export async function artist({ id }) {
     : null;
   if (!data && !played) throw limited || fail("unavailable", t("This artist isn't available."));
   const result = data ? { ...toArtist(data), following } : { ...played.artist, following: false };
-  const tracks = played?.tracks?.length ? played.tracks : await unlessLimited(() => artistTracks(result), []);
+  const tracks = played?.tracks?.length
+    ? played.tracks
+    : await unlessLimited(() => artistTracks(result), [], (error) => { tracksSpent = error; });
   const albumList = albums.length ? albums.filter(Boolean).map(toAlbum) : played?.albums || [];
-  return { artist: result, tracks, albums: albumList };
+  // A section the quota left empty, with nothing standing in for it.
+  const spent = (!tracks.length && tracksSpent) || (!albumList.length && albumsSpent) || null;
+  // The page has no line of text of its own, so the reason heads its songs:
+  // a page with nothing else on it says why, instead of claiming the artist
+  // has nothing.
+  return { artist: result, tracks: spent ? [quotaRow(spent), ...tracks] : tracks, albums: albumList };
 }
 
 export async function followArtist({ id, on }) {
@@ -2296,6 +2368,9 @@ async function confirmPlaying(uris, deadline = Infinity, device = "") {
 
 export async function remotePlay({ ids, start = 0, position = 0 }) {
   if (!Array.isArray(ids) || !ids.length) throw fail("unavailable", t("There's nothing to play."));
+  // The note heading an artist page the quota emptied isn't a song: Play on
+  // that page starts at the first song after it.
+  while (start < ids.length - 1 && ids[start] === QUOTA_ROW) start++;
   const first = uriOf(ids[start] ?? "");
   if (!first) throw fail("unavailable", t("Spotify can't play this song."));
   const uris = [];
