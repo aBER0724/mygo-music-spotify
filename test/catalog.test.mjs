@@ -670,3 +670,72 @@ test("a page Spotify answered says nothing of a quota spent elsewhere", async ()
   const top = await plugin.browse({ page: "top" });
   assert.equal(top.description, undefined);
 });
+
+test("the playlists page lists every playlist, yours first", async () => {
+  const { plugin } = await setup((call) => {
+    const path = call.url.pathname;
+    if (path === "/v1/me") return json(me);
+    if (path === "/v1/me/playlists") {
+      const offset = Number(call.url.searchParams.get("offset") || 0);
+      const items = Array.from({ length: offset ? 10 : 50 }, (_, i) => ({
+        id: `p${offset + i}`, name: `List ${offset + i}`, owner: { id: (offset + i) % 2 ? "other" : "listener" }, items: { total: 1 },
+      }));
+      return json({ items, next: offset ? null : "https://api.spotify.com/v1/me/playlists?offset=50&limit=50" });
+    }
+    throw new Error(`unexpected ${path}`);
+  }, { saved: signedIn() });
+  const page = await plugin.browse({ page: "playlists" });
+  assert.equal(page.description, undefined);
+  assert.deepEqual(page.sections.map((s) => s.title), ["Created by you", "Saved playlists"]);
+  // All 60, past the 20 that home shows.
+  assert.equal(page.sections[0].playlists.length + page.sections[1].playlists.length, 60);
+  assert.ok(page.sections[0].playlists.every((p) => p.mine));
+  assert.ok(page.sections[1].playlists.every((p) => !p.mine));
+});
+
+test("the playlists page has no saved section when there are none", async () => {
+  const { plugin } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    return json({ items: [{ id: "p", name: "Mine", owner: { id: "listener" }, items: { total: 1 } }], next: null });
+  }, { saved: signedIn() });
+  const page = await plugin.browse({ page: "playlists" });
+  assert.deepEqual(page.sections.map((s) => s.title), ["Created by you"]);
+});
+
+test("the following page lists followed artists across cursor pages", async () => {
+  const asked = [];
+  const { plugin } = await setup((call) => {
+    assert.equal(call.url.pathname, "/v1/me/following");
+    assert.equal(call.url.searchParams.get("type"), "artist");
+    const after = call.url.searchParams.get("after");
+    asked.push(after);
+    if (!after) {
+      return json({ artists: { items: [{ id: "a1", name: "One", images: [] }],
+        next: "https://api.spotify.com/v1/me/following?type=artist&limit=50&after=a1" } });
+    }
+    return json({ artists: { items: [{ id: "a2", name: "Two", images: [] }], next: null } });
+  }, { saved: signedIn() });
+  const page = await plugin.browse({ page: "following" });
+  assert.deepEqual(page.sections[0].artists.map((a) => [a.id, a.following]), [["a1", true], ["a2", true]]);
+  assert.deepEqual(asked, [null, "a1"]);
+});
+
+test("the following page says why it is empty when the quota is spent", async () => {
+  const { plugin } = await setup(() => spent(), { saved: signedIn() });
+  const page = await plugin.browse({ page: "following" });
+  assert.deepEqual(page.sections[0].artists, []);
+  assert.match(page.description, /quota for your app is spent/);
+  assert.match(page.sections[0].empty, /about 10 h/);
+});
+
+test("home's playlists lead to the playlists page", async () => {
+  const { plugin } = await setup((call) => {
+    if (call.url.pathname === "/v1/me") return json(me);
+    return json({ items: [], next: null });
+  }, { saved: signedIn() });
+  const home = await plugin.home();
+  const lists = home.sections.find((s) => s.title === "Your playlists");
+  assert.equal(lists.morePage, "playlists");
+  // The page it leads to is one the plugin serves.
+  await plugin.browse({ page: lists.morePage });
+});

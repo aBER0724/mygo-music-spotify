@@ -738,6 +738,23 @@ async function topArtists(range, limit) {
   return (data?.items || []).filter(Boolean).map(toArtist);
 }
 
+// The artists the listener follows. Spotify pages them by cursor, under
+// `artists`, so they are read here rather than by collect.
+async function followedArtists(max = 1000) {
+  const items = [];
+  let next = null;
+  let data = await api("GET", "/me/following", { query: { type: "artist", limit: PAGE } });
+  while (data) {
+    const page = data.artists || {};
+    const added = (page.items || []).filter(Boolean);
+    items.push(...added);
+    next = page.next;
+    if (!next || !added.length || items.length >= max) break;
+    data = await api("GET", next);
+  }
+  return items.slice(0, max).map((artist) => ({ ...toArtist(artist), following: true }));
+}
+
 // settled runs optional sections side by side. One that fails says so in its
 // section, unless the listener has to sign in or set the plugin up.
 async function settled(tasks) {
@@ -773,7 +790,7 @@ export async function home() {
         empty: emptyOr(artistsResult, t("Spotify needs more listening to pick your top artists.")),
       },
       {
-        title: t("Your playlists"), playlists: (listsResult.value || []).slice(0, 20),
+        title: t("Your playlists"), playlists: (listsResult.value || []).slice(0, 20), morePage: "playlists",
         empty: emptyOr(listsResult, t("You have no playlists yet.")),
       },
     ],
@@ -821,6 +838,34 @@ export async function browse({ page }) {
       sections: [{
         title: t("Your playlists"), playlists: lists.filter((item) => item.mine),
         empty: emptyOr(listsResult, t("You have no playlists yet.")),
+      }],
+    };
+  }
+  if (page === "playlists") {
+    const [listsResult] = await settled([playlists()]);
+    const lists = listsResult.value || [];
+    const theirs = lists.filter((item) => !item.mine);
+    return {
+      title: t("Playlists"), ...quotaLine([listsResult]),
+      sections: [
+        {
+          title: t("Created by you"), playlists: lists.filter((item) => item.mine),
+          empty: emptyOr(listsResult, t("You have no playlists yet.")),
+        },
+        // Only worth a heading when there are some, or when it failed.
+        ...(theirs.length || listsResult.error
+          ? [{ title: t("Saved playlists"), playlists: theirs, empty: emptyOr(listsResult, "") }]
+          : []),
+      ],
+    };
+  }
+  if (page === "following") {
+    const [artistsResult] = await settled([followedArtists()]);
+    return {
+      title: t("Following"), ...quotaLine([artistsResult]),
+      sections: [{
+        artists: artistsResult.value || [],
+        empty: emptyOr(artistsResult, t("Artists you follow in Spotify show here.")),
       }],
     };
   }

@@ -63,6 +63,16 @@
       "builtin": "savedAlbums"
     },
     {
+      "title": "Playlists",
+      "page": "playlists",
+      "icon": "playlist"
+    },
+    {
+      "title": "Following",
+      "page": "following",
+      "icon": "artist"
+    },
+    {
       "title": "Podcasts",
       "builtin": "shows"
     }

@@ -100,5 +100,10 @@
   "It comes back in about {minutes} min.": "大约 {minutes} 分钟后恢复。",
   "Each app in the Spotify Developer Dashboard has a quota of its own.": "开发者面板里的每个应用各自有一份配额。",
   "Spotify withdrew the extra approval. The next page that needs it asks again.": "Spotify 收回了那次额外授权。下一个需要它的页面会重新请求。",
-  "The popular songs on an artist's page need one more Spotify approval. Close the page to skip.": "歌手页的热门歌曲需要再授权一次 Spotify。关闭页面即可跳过。"
+  "The popular songs on an artist's page need one more Spotify approval. Close the page to skip.": "歌手页的热门歌曲需要再授权一次 Spotify。关闭页面即可跳过。",
+  "Playlists": "歌单",
+  "Following": "关注的歌手",
+  "Created by you": "你创建的",
+  "Saved playlists": "收藏的歌单",
+  "Artists you follow in Spotify show here.": "在 Spotify 关注的歌手会显示在这里。"
 }
